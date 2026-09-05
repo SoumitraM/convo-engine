@@ -1,0 +1,20 @@
+{
+  "name": "basic-chat-app",
+  "version": "0.1.0",
+  "description": "Sample app demonstrating @soumitrm/convo-engine",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo":        "npx tsx src/demo.ts",
+    "demo:stream": "npx tsx src/demo-stream.ts",
+    "demo:agent":  "npx tsx src/demo-agent.ts"
+  },
+  "dependencies": {
+    "@soumitrm/convo-engine": "file:../.."
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0",
+    "dotenv": "^16.0.0"
+  }
+}

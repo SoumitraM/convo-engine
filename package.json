@@ -1,0 +1,70 @@
+{
+  "name": "@soumitrm/convo-engine",
+  "version": "0.1.0",
+  "description": "Standalone TypeScript module for managing multi-turn LLM conversations",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SoumitraM/convo-engine"
+  },
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./adapters/claude": {
+      "import": "./dist/adapters/provider/claude.js",
+      "require": "./dist/adapters/provider/claude.cjs"
+    },
+    "./adapters/openai": {
+      "import": "./dist/adapters/provider/openai.js",
+      "require": "./dist/adapters/provider/openai.cjs"
+    },
+    "./adapters/gateway": {
+      "import": "./dist/adapters/provider/gateway.js",
+      "require": "./dist/adapters/provider/gateway.cjs"
+    },
+    "./adapters/storage/memory": {
+      "import": "./dist/adapters/storage/in-memory.js",
+      "require": "./dist/adapters/storage/in-memory.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.24.0",
+    "@types/node": "^20.0.0",
+    "openai": "^4.52.0",
+    "tsup": "^8.1.0",
+    "typescript": "^5.5.0",
+    "vitest": "^1.6.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.20.0",
+    "openai": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "openai": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
