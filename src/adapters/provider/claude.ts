@@ -32,7 +32,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   constructor(options: ClaudeProviderAdapterOptions) {
     this.client = new Anthropic({ apiKey: options.apiKey });
-    this.model = options.model ?? 'claude-3-5-sonnet-20241022';
+    this.model = options.model ?? 'claude-haiku-4-5-20251001';
     this.maxTokens = options.maxTokens ?? 8192;
   }
 
