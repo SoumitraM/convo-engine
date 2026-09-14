@@ -27,18 +27,24 @@ npm test
 npm run build
 ```
 
-Changes to `main` must go through a pull request (enforced by a local pre-push hook — see `.husky/pre-push`). CI (`.github/workflows/ci.yml`) runs typecheck/test/build on every PR.
+Changes to `main` go through a pull request — GitHub branch protection requires 1 approval and a passing `test` status check, and a local pre-push hook (`.husky/pre-push`) blocks direct pushes to `main` as a first line of defense. CI (`.github/workflows/ci.yml`) runs typecheck/test/build on every PR.
 
 ## Releasing
 
-1. Bump `version` in `package.json` (e.g. `npm version patch`).
-2. Push the resulting tag: `git push origin main --tags` (from a merged PR, not a direct push to `main`).
-3. `.github/workflows/publish.yml` publishes to npm automatically when a tag matching `v*.*.*` is pushed, provided the `NPM_TOKEN` repo secret is set.
+Publishing uses [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC) — no long-lived npm token stored in the repo.
 
-To publish manually instead:
+**First release only** (a brand-new package can't use OIDC until it exists on the registry):
 
 ```bash
 npm login
 npm run build
 npm publish
 ```
+
+Then on [npmjs.com → package settings → Trusted Publisher](https://docs.npmjs.com/trusted-publishers/), add a GitHub Actions publisher pointing at this repo and the `publish.yml` workflow.
+
+**Every release after that:**
+
+1. Bump `version` in `package.json` (e.g. `npm version patch`) via a PR.
+2. Once merged, tag the release from `main`: `git tag v<version> && git push origin v<version>`.
+3. `.github/workflows/publish.yml` builds and publishes automatically via OIDC when a tag matching `v*.*.*` is pushed.
