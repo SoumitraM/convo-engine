@@ -1,14 +1,14 @@
 /**
- * @soumitrm/convo-engine — public exports
+ * @smsoumitra/convo-engine — public exports
  *
  * This is the only root-level import consumers need:
- *   import { ConversationEngine } from '@soumitrm/convo-engine';
+ *   import { ConversationEngine } from '@smsoumitra/convo-engine';
  *
  * Provider adapters are behind subpath exports (so they don't force peer dep installs):
- *   import { ClaudeProviderAdapter }   from '@soumitrm/convo-engine/adapters/claude';
- *   import { OpenAIProviderAdapter }   from '@soumitrm/convo-engine/adapters/openai';
- *   import { GatewayProviderAdapter }  from '@soumitrm/convo-engine/adapters/gateway';
- *   import { InMemoryStorageAdapter }  from '@soumitrm/convo-engine/adapters/storage/memory';
+ *   import { ClaudeProviderAdapter }   from '@smsoumitra/convo-engine/adapters/claude';
+ *   import { OpenAIProviderAdapter }   from '@smsoumitra/convo-engine/adapters/openai';
+ *   import { GatewayProviderAdapter }  from '@smsoumitra/convo-engine/adapters/gateway';
+ *   import { InMemoryStorageAdapter }  from '@smsoumitra/convo-engine/adapters/storage/memory';
  */
 
 // ── Engine ────────────────────────────────────────────────────────────────

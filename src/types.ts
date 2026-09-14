@@ -1,5 +1,5 @@
 /**
- * Core types for @soumitrm/convo-engine.
+ * Core types for @smsoumitra/convo-engine.
  * Zero runtime dependencies — pure TypeScript types.
  */
 

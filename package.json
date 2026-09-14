@@ -1,5 +1,5 @@
 {
-  "name": "@soumitrm/convo-engine",
+  "name": "@smsoumitra/convo-engine",
   "version": "0.1.0",
   "description": "Standalone TypeScript module for managing multi-turn LLM conversations",
   "repository": {

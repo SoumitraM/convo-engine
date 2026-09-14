@@ -1,19 +1,19 @@
-# @soumitrm/convo-engine
+# @smsoumitra/convo-engine
 
 Standalone TypeScript module for managing multi-turn LLM conversations.
 
 ## Install
 
 ```bash
-npm install @soumitrm/convo-engine
+npm install @smsoumitra/convo-engine
 ```
 
 Provider adapters live behind subpath exports so you only pull in the peer dependency you need:
 
 ```ts
-import { ConversationEngine } from '@soumitrm/convo-engine';
-import { ClaudeProviderAdapter } from '@soumitrm/convo-engine/adapters/claude';
-import { InMemoryStorageAdapter } from '@soumitrm/convo-engine/adapters/storage/memory';
+import { ConversationEngine } from '@smsoumitra/convo-engine';
+import { ClaudeProviderAdapter } from '@smsoumitra/convo-engine/adapters/claude';
+import { InMemoryStorageAdapter } from '@smsoumitra/convo-engine/adapters/storage/memory';
 ```
 
 `@anthropic-ai/sdk` and `openai` are optional peer dependencies — install whichever provider SDK you use.
