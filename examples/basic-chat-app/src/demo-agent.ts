@@ -9,9 +9,9 @@
  */
 
 import 'dotenv/config';
-import { ConversationEngine, InMemoryStorageAdapter } from '@soumitrm/convo-engine';
-import type { ToolDefinition } from '@soumitrm/convo-engine';
-import { createGatewayProviderAdapter } from '@soumitrm/convo-engine/adapters/gateway';
+import { ConversationEngine, InMemoryStorageAdapter } from '@smsoumitra/convo-engine';
+import type { ToolDefinition } from '@smsoumitra/convo-engine';
+import { createGatewayProviderAdapter } from '@smsoumitra/convo-engine/adapters/gateway';
 
 // ── Tool definitions ──────────────────────────────────────────────────────
 

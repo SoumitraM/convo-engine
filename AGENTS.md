@@ -4,7 +4,7 @@ This file provides guidance to agents when working with code in this repository.
 
 ## What this package is
 
-`@soumitrm/convo-engine` — a standalone TypeScript library for multi-turn LLM conversations. **Full spec: `../ConvoEngine_Spec.md` and `../GatewayProviderAdapter_Spec.md`** (workspace root). Read Sections 3–15 of the spec before touching any code.
+`@smsoumitra/convo-engine` — a standalone TypeScript library for multi-turn LLM conversations. **Full spec: `../ConvoEngine_Spec.md` and `../GatewayProviderAdapter_Spec.md`** (workspace root). Read Sections 3–15 of the spec before touching any code.
 
 ## Commands
 
@@ -22,7 +22,7 @@ npm test -- --reporter=verbose  # detailed output
 - `tsup` is configured with **5 separate entry points** (index + 4 adapters) — each produces its own ESM+CJS pair. Adding a new adapter requires a new entry in `tsup.config.ts` AND a new subpath export in `package.json`.
 - `external: ['@anthropic-ai/sdk', 'openai']` in `tsup.config.ts` — these must never be bundled.
 - The subpath export `./adapters/storage/memory` maps to `dist/adapters/storage/in-memory.js` — the file is named `in-memory` but the export path says `memory`. Don't rename either without updating both.
-- `examples/basic-chat-app` uses npm workspaces: `"@soumitrm/convo-engine": "workspace:*"` — the examples depend on the parent package by name, not by `file:` path.
+- `examples/basic-chat-app` uses npm workspaces: `"@smsoumitra/convo-engine": "workspace:*"` — the examples depend on the parent package by name, not by `file:` path.
 
 ## Test file placement
 
