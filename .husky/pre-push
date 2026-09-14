@@ -1,0 +1,9 @@
+protected_branch="main"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  branch="${remote_ref#refs/heads/}"
+  if [ "$branch" = "$protected_branch" ]; then
+    echo "Direct push to '$protected_branch' is blocked — open a pull request instead."
+    exit 1
+  fi
+done
