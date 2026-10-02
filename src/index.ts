@@ -21,6 +21,7 @@ export {
 export type {
   ConversationEngineConfig,
   ToolExecutor,
+  AgentLoopOptions,
 } from './engine.js';
 
 // ── Core types ────────────────────────────────────────────────────────────

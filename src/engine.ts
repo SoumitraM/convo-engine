@@ -38,6 +38,13 @@ export interface ConversationEngineConfig {
   defaultSystemPrompt?: string;
 }
 
+export interface AgentLoopOptions {
+  tools: ToolDefinition[];
+  toolExecutor: ToolExecutor;
+  systemPrompt?: string;
+  maxIterations?: number;
+}
+
 export class ConversationEngine {
   private readonly storage: StorageAdapter;
   private readonly provider: ProviderAdapter;
@@ -235,12 +242,7 @@ export class ConversationEngine {
   async agentLoop(
     threadId: ThreadId,
     userContent: string | ContentBlock[],
-    opts: {
-      tools: ToolDefinition[];
-      toolExecutor: ToolExecutor;
-      systemPrompt?: string;
-      maxIterations?: number;
-    },
+    opts: AgentLoopOptions,
   ): Promise<Message> {
     const maxIterations = opts.maxIterations ?? 10;
     const systemPrompt = opts.systemPrompt ?? this.defaultSystemPrompt;
@@ -334,6 +336,163 @@ export class ConversationEngine {
     }
 
     throw new MaxIterationsExceededError(maxIterations);
+  }
+
+  // ── streamAgentLoop ───────────────────────────────────────────────────────
+
+  /**
+   * Like agentLoop, but streams each iteration's text deltas as they arrive
+   * instead of waiting for the full turn. Tool calls are still executed and
+   * looped internally — the stream goes quiet during tool execution and
+   * resumes once the next iteration starts producing text. Exactly one
+   * `{ done: true }` chunk is yielded, at the very end of the whole turn
+   * (not after each iteration), so callers see one continuous stream per
+   * user message regardless of how many tool round-trips happened inside it.
+   */
+  streamAgentLoop(
+    threadId: ThreadId,
+    userContent: string | ContentBlock[],
+    opts: AgentLoopOptions,
+  ): { stream: AsyncIterable<ProviderStreamChunk>; completion: Promise<Message> } {
+    const maxIterations = opts.maxIterations ?? 10;
+    const systemPrompt = opts.systemPrompt ?? this.defaultSystemPrompt;
+
+    let resolveCompletion!: (msg: Message) => void;
+    let rejectCompletion!: (err: unknown) => void;
+    const completion = new Promise<Message>((res, rej) => {
+      resolveCompletion = res;
+      rejectCompletion = rej;
+    });
+
+    const engine = this;
+
+    async function* generateStream(): AsyncIterable<ProviderStreamChunk> {
+      try {
+        const { thread, userMessage } = await engine._prepareUserMessage(
+          threadId,
+          userContent,
+        );
+
+        let iteration = 0;
+
+        while (iteration < maxIterations) {
+          iteration++;
+
+          // Re-fetch history every iteration so intermediate tool messages are included
+          const history = await engine.storage.getMessages(threadId);
+          const priorHistory = history.slice(0, -1);
+          const currentMessage = history[history.length - 1];
+
+          let ctx: SendContext = {
+            thread,
+            history: priorHistory,
+            newMessage: currentMessage,
+            systemPrompt,
+            tools: opts.tools,
+          };
+
+          ctx = await engine._runBeforeSend(ctx);
+
+          const messages = engine.strategy.assemble(ctx.history, ctx.newMessage);
+
+          let providerStream: AsyncIterable<ProviderStreamChunk>;
+          try {
+            providerStream = engine.provider.stream({
+              systemPrompt: ctx.systemPrompt,
+              messages,
+              tools: ctx.tools,
+            });
+          } catch (err) {
+            engine._callOnError(err, 'provider');
+            rejectCompletion(err);
+            throw err;
+          }
+
+          // Accumulate this iteration's output. Text arrives as string deltas;
+          // tool_use arrives as a ContentBlock delta (see provider adapters'
+          // stream() implementations) — never mixed into the same delta.
+          const toolUseBlocks: ContentBlock[] = [];
+          let textBuffer = '';
+
+          for await (const chunk of providerStream) {
+            // Swallow each iteration's own terminal chunk — only one `done`
+            // is surfaced to the caller, at the end of the whole loop.
+            if (chunk.done) continue;
+            if (typeof chunk.delta === 'string') {
+              textBuffer += chunk.delta;
+            } else {
+              toolUseBlocks.push(chunk.delta);
+            }
+            yield chunk;
+          }
+
+          const finalBlocks: ContentBlock[] = [];
+          if (textBuffer.length > 0) finalBlocks.push({ type: 'text', text: textBuffer });
+          finalBlocks.push(...toolUseBlocks);
+
+          const assistantMessage = await engine.storage.appendMessage(threadId, {
+            threadId,
+            role: 'assistant',
+            content: finalBlocks,
+          });
+
+          if (toolUseBlocks.length === 0) {
+            // No tool calls this iteration — the turn is over.
+            const rawResponse: ProviderResponse = {
+              content: finalBlocks,
+              stopReason: 'stop',
+              usage: { inputTokens: 0, outputTokens: 0 },
+            };
+
+            await engine._runAfterReceive({
+              thread,
+              userMessage,
+              assistantMessage,
+              rawResponse,
+            });
+
+            yield { delta: '', done: true };
+            resolveCompletion(assistantMessage);
+            return;
+          }
+
+          // Execute all requested tools and persist results, then loop again.
+          for (const block of toolUseBlocks) {
+            const toolUse = block as Extract<ContentBlock, { type: 'tool_use' }>;
+            let resultContent: string;
+            try {
+              const result = await opts.toolExecutor(toolUse.name, toolUse.input);
+              resultContent = typeof result === 'string' ? result : JSON.stringify(result);
+            } catch (err) {
+              engine._callOnError(err, 'toolExecutor');
+              rejectCompletion(err);
+              throw err;
+            }
+
+            await engine.storage.appendMessage(threadId, {
+              threadId,
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: toolUse.id,
+                  content: resultContent,
+                },
+              ],
+            });
+          }
+        }
+
+        const err = new MaxIterationsExceededError(maxIterations);
+        rejectCompletion(err);
+        throw err;
+      } catch (err) {
+        rejectCompletion(err);
+        throw err;
+      }
+    }
+
+    return { stream: generateStream(), completion };
   }
 
   // ── Private helpers ───────────────────────────────────────────────────────
