@@ -45,6 +45,29 @@ function makeMockProvider(responses: ProviderResponse[]): ProviderAdapter {
   };
 }
 
+/**
+ * A provider whose stream() replays one scripted chunk sequence per call
+ * (matching how a real adapter's stream() yields text deltas followed by
+ * any tool_use ContentBlock deltas, then a terminal done:true — see
+ * claude.ts/openai.ts/gateway.ts stream()). Used to test streamAgentLoop's
+ * multi-iteration tool loop.
+ */
+function makeMockStreamingProvider(scripts: ProviderStreamChunk[][]): ProviderAdapter {
+  let callCount = 0;
+  return {
+    send: vi.fn(async () => {
+      throw new Error('send() should not be called by streamAgentLoop');
+    }),
+    stream: vi.fn(function (): AsyncIterable<ProviderStreamChunk> {
+      const script = scripts[callCount] ?? scripts[scripts.length - 1];
+      callCount++;
+      return (async function* () {
+        yield* script;
+      })();
+    }),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // sendMessage
 // ---------------------------------------------------------------------------
@@ -371,5 +394,151 @@ describe('ConversationEngine.agentLoop', () => {
         maxIterations: 3,
       }),
     ).rejects.toThrow(MaxIterationsExceededError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// streamAgentLoop
+// ---------------------------------------------------------------------------
+
+describe('ConversationEngine.streamAgentLoop', () => {
+  it('streams text-only turns like streamMessage and persists the final message', async () => {
+    const storage = new InMemoryStorageAdapter();
+    const provider = makeMockStreamingProvider([
+      [
+        { delta: 'It is ', done: false },
+        { delta: 'noon.', done: false },
+        { delta: '', done: true },
+      ],
+    ]);
+    const engine = new ConversationEngine({ storage, provider });
+
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+    const { stream, completion } = engine.streamAgentLoop(thread.id, 'What time is it?', {
+      tools: [{ name: 'get_time', description: 'Get the current time', inputSchema: {} }],
+      toolExecutor: vi.fn(async () => '12:00'),
+    });
+
+    const chunks: ProviderStreamChunk[] = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const finalMsg = await completion;
+
+    expect(chunks.filter(c => !c.done).map(c => c.delta)).toEqual(['It is ', 'noon.']);
+    // Exactly one done:true for the whole turn
+    expect(chunks.filter(c => c.done)).toHaveLength(1);
+    expect(chunks[chunks.length - 1].done).toBe(true);
+
+    expect(finalMsg.role).toBe('assistant');
+    const history = await engine.getHistory(thread.id);
+    expect(history).toHaveLength(2); // user, assistant
+  });
+
+  it('streams across a tool call without an intermediate done:true, then resolves', async () => {
+    const storage = new InMemoryStorageAdapter();
+    const provider = makeMockStreamingProvider([
+      [
+        { delta: 'Let me check.', done: false },
+        { delta: { type: 'tool_use', id: 'call_1', name: 'get_time', input: {} }, done: false },
+        { delta: '', done: true },
+      ],
+      [
+        { delta: 'It is noon.', done: false },
+        { delta: '', done: true },
+      ],
+    ]);
+    const toolExecutor = vi.fn(async () => '12:00');
+    const engine = new ConversationEngine({ storage, provider });
+
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+    const { stream, completion } = engine.streamAgentLoop(thread.id, 'What time is it?', {
+      tools: [{ name: 'get_time', description: 'Get the current time', inputSchema: {} }],
+      toolExecutor,
+    });
+
+    const chunks: ProviderStreamChunk[] = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const finalMsg = await completion;
+
+    // Only one done:true across both iterations, and it's the last chunk
+    expect(chunks.filter(c => c.done)).toHaveLength(1);
+    expect(chunks[chunks.length - 1].done).toBe(true);
+
+    const textDeltas = chunks.filter(c => !c.done && typeof c.delta === 'string').map(c => c.delta);
+    expect(textDeltas).toEqual(['Let me check.', 'It is noon.']);
+
+    expect(toolExecutor).toHaveBeenCalledWith('get_time', {});
+    expect(finalMsg.role).toBe('assistant');
+
+    // user, assistant(text+tool_use), tool_result(user), final assistant
+    const history = await engine.getHistory(thread.id);
+    expect(history).toHaveLength(4);
+    expect(history[1].role).toBe('assistant');
+    expect(Array.isArray(history[1].content)).toBe(true);
+    const iterationOneBlocks = history[1].content as ContentBlock[];
+    expect(iterationOneBlocks.map(b => b.type)).toEqual(['text', 'tool_use']);
+    expect(history[2].role).toBe('user');
+    expect((history[2].content as ContentBlock[])[0].type).toBe('tool_result');
+  });
+
+  it('afterReceive fires exactly once, on the final message only', async () => {
+    const storage = new InMemoryStorageAdapter();
+    const provider = makeMockStreamingProvider([
+      [{ delta: { type: 'tool_use', id: 'c1', name: 'tool_a', input: {} }, done: false }, { delta: '', done: true }],
+      [{ delta: 'Done.', done: false }, { delta: '', done: true }],
+    ]);
+    const afterReceive = vi.fn();
+    const engine = new ConversationEngine({ storage, provider, hooks: { afterReceive } });
+
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+    const { stream, completion } = engine.streamAgentLoop(thread.id, 'Go', {
+      tools: [{ name: 'tool_a', description: 'x', inputSchema: {} }],
+      toolExecutor: async () => 'result',
+    });
+
+    for await (const _ of stream) { /* drain */ }
+    await completion;
+
+    expect(afterReceive).toHaveBeenCalledTimes(1);
+  });
+
+  it('toolExecutor throws: onError called with toolExecutor phase, completion rejects', async () => {
+    const storage = new InMemoryStorageAdapter();
+    const provider = makeMockStreamingProvider([
+      [{ delta: { type: 'tool_use', id: 'c1', name: 'bad_tool', input: {} }, done: false }, { delta: '', done: true }],
+    ]);
+    const onError = vi.fn();
+    const engine = new ConversationEngine({ storage, provider, hooks: { onError } });
+
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+    const { stream, completion } = engine.streamAgentLoop(thread.id, 'Go', {
+      tools: [{ name: 'bad_tool', description: 'x', inputSchema: {} }],
+      toolExecutor: async () => { throw new Error('tool failure'); },
+    });
+
+    await expect((async () => { for await (const _ of stream) { /* drain */ } })()).rejects.toThrow('tool failure');
+    await expect(completion).rejects.toThrow('tool failure');
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), 'toolExecutor');
+  });
+
+  it('throws MaxIterationsExceededError when the tool loop runs too long', async () => {
+    const storage = new InMemoryStorageAdapter();
+    const toolUseScript: ProviderStreamChunk[] = [
+      { delta: { type: 'tool_use', id: 'c1', name: 'tool_a', input: {} }, done: false },
+      { delta: '', done: true },
+    ];
+    const provider = makeMockStreamingProvider(Array(15).fill(toolUseScript));
+    const engine = new ConversationEngine({ storage, provider });
+
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+    const { stream, completion } = engine.streamAgentLoop(thread.id, 'Go', {
+      tools: [{ name: 'tool_a', description: 'x', inputSchema: {} }],
+      toolExecutor: async () => 'result',
+      maxIterations: 3,
+    });
+
+    await expect((async () => { for await (const _ of stream) { /* drain */ } })()).rejects.toThrow(
+      MaxIterationsExceededError,
+    );
+    await expect(completion).rejects.toThrow(MaxIterationsExceededError);
   });
 });

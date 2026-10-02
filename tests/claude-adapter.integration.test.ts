@@ -216,4 +216,114 @@ describe.skipIf(SKIP)('ClaudeProviderAdapter — live integration', () => {
     const history = await engine.getHistory(thread.id);
     expect(history).toHaveLength(2);
   });
+
+  it('ConversationEngine.streamAgentLoop — text-only turn streams and persists correctly', async () => {
+    const engine = new ConversationEngine({
+      storage: new InMemoryStorageAdapter(),
+      provider: makeAdapter(),
+      defaultSystemPrompt: 'Reply in one sentence only.',
+    });
+
+    const thread = await engine.createThread({ type: 'integration_test', ownerId: 'test-user' });
+
+    const { stream, completion } = engine.streamAgentLoop(
+      thread.id,
+      'Say "streaming works" and nothing else.',
+      {
+        tools: [{
+          name: 'get_current_time',
+          description: 'Returns the current date and time as an ISO 8601 string.',
+          inputSchema: { type: 'object', properties: {}, required: [] },
+        }],
+        toolExecutor: async () => new Date().toISOString(),
+      },
+    );
+
+    const chunks: string[] = [];
+    let doneCount = 0;
+    for await (const chunk of stream) {
+      if (chunk.done) {
+        doneCount++;
+      } else if (typeof chunk.delta === 'string') {
+        chunks.push(chunk.delta);
+      }
+    }
+
+    const savedMsg = await completion;
+    const fullText = chunks.join('');
+    console.log('  streamed text:', fullText);
+
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(fullText.toLowerCase()).toContain('streaming');
+    expect(doneCount).toBe(1); // exactly one terminal chunk for the whole turn
+    expect(savedMsg.role).toBe('assistant');
+
+    const history = await engine.getHistory(thread.id);
+    expect(history).toHaveLength(2);
+  });
+
+  it('ConversationEngine.streamAgentLoop — streams through a real tool call with one terminal chunk', async () => {
+    const engine = new ConversationEngine({
+      storage: new InMemoryStorageAdapter(),
+      provider: makeAdapter(),
+      defaultSystemPrompt:
+        'You are a helpful assistant. When asked about the time, use the get_current_time tool, ' +
+        'then tell the user the time in one sentence.',
+    });
+
+    const thread = await engine.createThread({ type: 'integration_test', ownerId: 'test-user' });
+
+    const toolExecutor = async (toolName: string) => {
+      if (toolName === 'get_current_time') return new Date().toISOString();
+      throw new Error(`Unknown tool: ${toolName}`);
+    };
+
+    const { stream, completion } = engine.streamAgentLoop(
+      thread.id,
+      'What is the current time?',
+      {
+        tools: [{
+          name: 'get_current_time',
+          description: 'Returns the current date and time as an ISO 8601 string.',
+          inputSchema: { type: 'object', properties: {}, required: [] },
+        }],
+        toolExecutor,
+        maxIterations: 5,
+      },
+    );
+
+    const textChunks: string[] = [];
+    const toolUseChunks: unknown[] = [];
+    let doneCount = 0;
+    for await (const chunk of stream) {
+      if (chunk.done) {
+        doneCount++;
+      } else if (typeof chunk.delta === 'string') {
+        textChunks.push(chunk.delta);
+      } else {
+        toolUseChunks.push(chunk.delta);
+      }
+    }
+
+    const finalMsg = await completion;
+    const fullText = textChunks.join('');
+    console.log('  streamed text across iterations:', fullText);
+    console.log('  tool_use deltas seen while streaming:', toolUseChunks.length);
+
+    // The real point of streamAgentLoop: the tool call happened mid-stream
+    // (Claude's stream() now surfaces it — see claude.ts stream() fix) and
+    // only ONE done:true was emitted for the entire multi-iteration turn.
+    expect(doneCount).toBe(1);
+    expect(fullText.length).toBeGreaterThan(0);
+
+    const text = Array.isArray(finalMsg.content)
+      ? finalMsg.content.filter(b => b.type === 'text').map(b => b.type === 'text' ? b.text : '').join('')
+      : finalMsg.content;
+    expect(text.length).toBeGreaterThan(0);
+
+    const history = await engine.getHistory(thread.id);
+    // user, assistant (tool_use [+ maybe text]), tool_result (user), final assistant
+    expect(history.length).toBeGreaterThanOrEqual(4);
+    console.log('  thread messages:', history.length);
+  });
 });

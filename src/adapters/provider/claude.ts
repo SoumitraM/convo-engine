@@ -93,6 +93,24 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       }
     }
 
+    // Tool calls arrive as input_json_delta events accumulated across the
+    // stream — rather than re-parsing those ourselves, use the SDK's own
+    // accumulation and pull tool_use blocks out of the finished message.
+    const finalMessage = await stream.finalMessage();
+    for (const block of finalMessage.content) {
+      if (block.type === 'tool_use') {
+        yield {
+          delta: {
+            type: 'tool_use',
+            id: block.id,
+            name: block.name,
+            input: block.input as Record<string, unknown>,
+          },
+          done: false,
+        };
+      }
+    }
+
     yield { delta: '', done: true };
   }
 }

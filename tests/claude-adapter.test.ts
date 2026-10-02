@@ -45,6 +45,21 @@ function makeAnthropicToolUseResponse(id: string, name: string, input: Record<st
   };
 }
 
+/**
+ * The real SDK's client.messages.stream() returns a MessageStream: async
+ * iterable over raw events, plus a finalMessage() the adapter calls after
+ * the loop to recover tool_use blocks (see claude.ts stream()).
+ */
+function makeFakeMessageStream(
+  events: unknown[],
+  finalMessage: { content: unknown[] },
+) {
+  return {
+    [Symbol.asyncIterator]: () => (async function* () { yield* events; })(),
+    finalMessage: vi.fn().mockResolvedValue(finalMessage),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // send()
 // ---------------------------------------------------------------------------
@@ -156,8 +171,9 @@ describe('ClaudeProviderAdapter.stream', () => {
       { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello' } },
       { type: 'content_block_delta', delta: { type: 'text_delta', text: ' world' } },
     ];
-    // stream() returns an async iterable
-    mockStream.mockReturnValue((async function* () { yield* fakeEvents; })());
+    mockStream.mockReturnValue(
+      makeFakeMessageStream(fakeEvents, { content: [{ type: 'text', text: 'Hello world' }] }),
+    );
 
     const adapter = new ClaudeProviderAdapter({ apiKey: 'test-key' });
     const chunks = [];
@@ -167,5 +183,40 @@ describe('ClaudeProviderAdapter.stream', () => {
 
     expect(chunks.filter(c => !c.done).map(c => c.delta)).toEqual(['Hello', ' world']);
     expect(chunks[chunks.length - 1].done).toBe(true);
+  });
+
+  it('yields a tool_use ContentBlock delta before the terminal chunk', async () => {
+    // No text_delta events — the model goes straight to a tool call, which
+    // only shows up in finalMessage() (see claude.ts stream()), not as
+    // content_block_delta/text_delta events.
+    const fakeEvents = [
+      { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Let me check...' } },
+    ];
+    mockStream.mockReturnValue(
+      makeFakeMessageStream(fakeEvents, {
+        content: [
+          { type: 'text', text: 'Let me check...' },
+          { type: 'tool_use', id: 'call_1', name: 'get_weather', input: { city: 'London' } },
+        ],
+      }),
+    );
+
+    const adapter = new ClaudeProviderAdapter({ apiKey: 'test-key' });
+    const chunks = [];
+    for await (const chunk of adapter.stream({ messages: [{ role: 'user', content: 'Weather?' }] })) {
+      chunks.push(chunk);
+    }
+
+    const toolUseChunk = chunks.find(c => !c.done && typeof c.delta !== 'string');
+    expect(toolUseChunk).toBeDefined();
+    expect(toolUseChunk?.delta).toEqual({
+      type: 'tool_use',
+      id: 'call_1',
+      name: 'get_weather',
+      input: { city: 'London' },
+    });
+    // Tool call must arrive before the terminal chunk
+    expect(chunks[chunks.length - 1].done).toBe(true);
+    expect(chunks[chunks.length - 2]).toBe(toolUseChunk);
   });
 });
