@@ -23,7 +23,16 @@ vi.mock('openai', () => {
   };
 });
 
+import OpenAI from 'openai';
 import { OpenAIProviderAdapter } from '../src/adapters/provider/openai.js';
+import {
+  RateLimitError,
+  ContextLengthError,
+  AuthenticationError,
+  InvalidRequestError,
+  ProviderError,
+} from '../src/errors.js';
+import { OpenAIAPIError, APIConnectionError } from './helpers/fake-sdk-errors.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -210,5 +219,203 @@ describe('OpenAIProviderAdapter.stream', () => {
       expect(toolDelta.input).toEqual({ q: 'hi' });
     }
     expect(chunks[chunks.length - 1].done).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R1 — toolChoice
+// ---------------------------------------------------------------------------
+
+const TOOLS = [{ name: 'record_facts', description: 'Record facts', inputSchema: { type: 'object' } }];
+
+describe('OpenAIProviderAdapter toolChoice', () => {
+  beforeEach(() => {
+    mockChatCreate.mockReset();
+    mockChatCreate.mockResolvedValue(makeOpenAITextResponse('ok'));
+  });
+
+  it.each([
+    [undefined, 'auto'],
+    ['auto', 'auto'],
+    ['any', 'required'],
+    ['none', 'none'],
+    [{ type: 'tool', name: 'record_facts' }, { type: 'function', function: { name: 'record_facts' } }],
+  ] as const)('maps %j → %j', async (choice, expected) => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await adapter.send({ messages: [{ role: 'user', content: 'Hi' }], tools: TOOLS, toolChoice: choice });
+    expect(mockChatCreate.mock.calls[0][0].tool_choice).toEqual(expected);
+  });
+
+  it('rejects a forced choice without tools', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await expect(adapter.send({ messages: [{ role: 'user', content: 'Hi' }], toolChoice: { type: 'tool', name: 'x' } }))
+      .rejects.toBeInstanceOf(InvalidRequestError);
+    expect(mockChatCreate).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — images and documents
+// ---------------------------------------------------------------------------
+
+describe('OpenAIProviderAdapter images and documents', () => {
+  beforeEach(() => {
+    mockChatCreate.mockReset();
+    mockChatCreate.mockResolvedValue(makeOpenAITextResponse('ok'));
+  });
+
+  it('sends images as image_url data URLs instead of dropping them', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await adapter.send({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'What is damaged?' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'abc' } },
+        ],
+      }],
+    });
+    expect(mockChatCreate.mock.calls[0][0].messages[0]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'What is damaged?' },
+        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,abc' } },
+      ],
+    });
+  });
+
+  it('sends a PDF as a file content part named after the title', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await adapter.send({
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0x' },
+          title: 'invoice.pdf',
+        }],
+      }],
+    });
+    expect(mockChatCreate.mock.calls[0][0].messages[0].content).toEqual([
+      { type: 'file', file: { filename: 'invoice.pdf', file_data: 'data:application/pdf;base64,JVBERi0x' } },
+    ]);
+  });
+
+  it('inlines a text document (with title and context) as text', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await adapter.send({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'document', source: { type: 'text', media_type: 'text/csv', data: 'a,b\n1,2' }, title: 'Tally', context: 'Sheet 1' },
+          { type: 'text', text: 'Check it.' },
+        ],
+      }],
+    });
+    expect(mockChatCreate.mock.calls[0][0].messages[0]).toEqual({
+      role: 'user',
+      content: '<document title="Tally" media_type="text/csv">\nSheet 1\n\na,b\n1,2\n</document>\nCheck it.',
+    });
+  });
+
+  it('rejects media in a non-user message', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await expect(adapter.send({
+      messages: [{
+        role: 'assistant',
+        content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } }],
+      }],
+    })).rejects.toBeInstanceOf(InvalidRequestError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R5 — system prompt blocks / R4 — options
+// ---------------------------------------------------------------------------
+
+describe('OpenAIProviderAdapter system blocks and options', () => {
+  beforeEach(() => {
+    mockChatCreate.mockReset();
+    vi.mocked(OpenAI).mockClear();
+    mockChatCreate.mockResolvedValue(makeOpenAITextResponse('ok'));
+  });
+
+  it('joins system prompt blocks with a blank line', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await adapter.send({
+      systemPrompt: [{ text: 'Prefix', cacheBreakpoint: true }, { text: 'Suffix' }],
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+    expect(mockChatCreate.mock.calls[0][0].messages[0]).toEqual({ role: 'system', content: 'Prefix\n\nSuffix' });
+  });
+
+  it('passes maxRetries / timeoutMs to the client and temperature to the request', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k', maxRetries: 1, timeoutMs: 5000, temperature: 0 });
+    expect(vi.mocked(OpenAI)).toHaveBeenCalledWith({ apiKey: 'k', maxRetries: 1, timeout: 5000 });
+    await adapter.send({ messages: [{ role: 'user', content: 'Hi' }] });
+    expect(mockChatCreate.mock.calls[0][0].temperature).toBe(0);
+  });
+
+  it('leaves defaults alone when options are omitted', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    expect(vi.mocked(OpenAI)).toHaveBeenCalledWith({ apiKey: 'k' });
+    await adapter.send({ messages: [{ role: 'user', content: 'Hi' }] });
+    expect(mockChatCreate.mock.calls[0][0]).not.toHaveProperty('temperature');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R3 — error mapping
+// ---------------------------------------------------------------------------
+
+describe('OpenAIProviderAdapter error mapping', () => {
+  beforeEach(() => { mockChatCreate.mockReset(); });
+
+  async function sendError(err: unknown): Promise<unknown> {
+    mockChatCreate.mockRejectedValue(err);
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    return adapter.send({ messages: [{ role: 'user', content: 'Hi' }] }).catch(e => e);
+  }
+
+  it('429 → RateLimitError, honouring retry-after-ms', async () => {
+    const err = await sendError(new OpenAIAPIError(
+      429, { message: 'Rate limit reached', type: 'requests', code: 'rate_limit_exceeded' }, { 'retry-after-ms': '250' },
+    ));
+    expect(err).toBeInstanceOf(RateLimitError);
+    expect((err as RateLimitError).retryAfterMs).toBe(250);
+    expect((err as RateLimitError).provider).toBe('openai');
+  });
+
+  it('context_length_exceeded → ContextLengthError', async () => {
+    const err = await sendError(new OpenAIAPIError(
+      400, { message: "This model's maximum context length is 128000 tokens.", type: 'invalid_request_error', code: 'context_length_exceeded' },
+    ));
+    expect(err).toBeInstanceOf(ContextLengthError);
+  });
+
+  it('401 → AuthenticationError', async () => {
+    const err = await sendError(new OpenAIAPIError(401, { message: 'Incorrect API key', code: 'invalid_api_key' }));
+    expect(err).toBeInstanceOf(AuthenticationError);
+  });
+
+  it('connection error → retryable ProviderError', async () => {
+    const err = await sendError(new APIConnectionError());
+    expect((err as ProviderError).constructor).toBe(ProviderError);
+    expect((err as ProviderError).retryable).toBe(true);
+  });
+
+  it('maps errors thrown while streaming', async () => {
+    mockChatCreate.mockResolvedValue({
+      [Symbol.asyncIterator]: () => (async function* () {
+        yield { choices: [{ delta: { content: 'Hi' } }] };
+        throw new OpenAIAPIError(undefined, { message: 'server overloaded', type: 'server_error' });
+      })(),
+    });
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    const err = await (async () => {
+      for await (const _ of adapter.stream({ messages: [{ role: 'user', content: 'Hi' }] })) { /* drain */ }
+    })().catch(e => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).retryable).toBe(true);
   });
 });

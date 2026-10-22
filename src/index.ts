@@ -32,7 +32,20 @@ export type {
   MessageId,
   MessageRole,
   ContentBlock,
+  DocumentSource,
 } from './types.js';
+
+// ── Provider errors ───────────────────────────────────────────────────────
+export {
+  ProviderError,
+  RateLimitError,
+  OverloadedError,
+  ContextLengthError,
+  AuthenticationError,
+  InvalidRequestError,
+} from './errors.js';
+
+export type { ProviderName, ProviderErrorOptions } from './errors.js';
 
 // ── StorageAdapter ─────────────────────────────────────────────────────────
 export type { StorageAdapter } from './adapters/storage/types.js';
@@ -46,7 +59,11 @@ export type {
   ProviderMessage,
   ProviderResponse,
   ProviderStreamChunk,
+  ProviderInput,
   ToolDefinition,
+  ToolChoice,
+  SystemPrompt,
+  SystemPromptBlock,
 } from './adapters/provider/types.js';
 
 // ── Context strategy ───────────────────────────────────────────────────────

@@ -327,3 +327,136 @@ describe.skipIf(SKIP)('ClaudeProviderAdapter — live integration', () => {
     console.log('  thread messages:', history.length);
   });
 });
+
+// ---------------------------------------------------------------------------
+// AquantX enhancement requests (docs/aquantx-requests.md) — live checks
+// ---------------------------------------------------------------------------
+
+/** Builds a one-page PDF containing `text` (Helvetica, ASCII only). */
+function makePdf(text: string): string {
+  const escaped = text.replace(/[\\()]/g, c => `\\${c}`);
+  const stream = `BT /F1 18 Tf 72 720 Td (${escaped}) Tj ET`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets: number[] = [];
+  objects.forEach((body, i) => {
+    offsets.push(pdf.length);
+    pdf += `${i + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xrefAt = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  pdf += offsets.map(o => `${String(o).padStart(10, '0')} 00000 n \n`).join('');
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF\n`;
+  return Buffer.from(pdf, 'latin1').toString('base64');
+}
+
+const LIVE_SKIP = SKIP || !process.env['ANTHROPIC_API_KEY'];
+
+describe.skipIf(LIVE_SKIP)('ClaudeProviderAdapter — AquantX requests, live', () => {
+  function makeAdapter(options: { temperature?: number } = {}) {
+    return new ClaudeProviderAdapter({
+      apiKey: process.env['ANTHROPIC_API_KEY']!,
+      model: process.env['ANTHROPIC_MODEL'] ?? 'claude-haiku-4-5-20251001',
+      ...options,
+    });
+  }
+
+  const recordTool = {
+    name: 'record_facts',
+    description: 'Record the facts found in the evidence.',
+    inputSchema: {
+      type: 'object',
+      properties: { facts: { type: 'array', items: { type: 'string' } } },
+      required: ['facts'],
+    },
+  };
+
+  it('R1 — a forced tool is always called, even when prose would be the natural reply', async () => {
+    const adapter = makeAdapter({ temperature: 0 });
+    for (let i = 0; i < 3; i++) {
+      const result = await adapter.send({
+        systemPrompt: 'You are a friendly assistant.',
+        messages: [{ role: 'user', content: 'Hi! How are you today?' }],
+        tools: [recordTool],
+        toolChoice: { type: 'tool', name: 'record_facts' },
+      });
+      const toolUse = result.content.find(b => b.type === 'tool_use');
+      expect(toolUse?.type === 'tool_use' && toolUse.name).toBe('record_facts');
+    }
+  });
+
+  it('R2 — reads a PDF and a CSV via send()', async () => {
+    const adapter = makeAdapter({ temperature: 0 });
+    const result = await adapter.send({
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: { type: 'base64', media_type: 'application/pdf', data: makePdf('Bill of lading number: BL-778812') },
+            title: 'Bill of lading',
+          },
+          {
+            type: 'document',
+            source: { type: 'text', media_type: 'text/csv', data: 'container,bags_damaged\nMSCU1234567,17\nMSCU7654321,23' },
+            title: 'Damage tally',
+          },
+          { type: 'text', text: 'Reply with the bill of lading number and the total damaged bags, as "<number> <total>".' },
+        ],
+      }],
+    });
+    const text = result.content.map(b => (b.type === 'text' ? b.text : '')).join('');
+    console.log('  reply:', text);
+    expect(text).toContain('BL-778812');
+    expect(text).toContain('40');
+  });
+
+  it('R2 — a PDF sent in a thread is persisted and replayed on the next turn', async () => {
+    const engine = new ConversationEngine({ storage: new InMemoryStorageAdapter(), provider: makeAdapter({ temperature: 0 }) });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    await engine.sendMessage(thread.id, [
+      {
+        type: 'document',
+        source: { type: 'base64', media_type: 'application/pdf', data: makePdf('Vessel name: MV OCEAN TALLY') },
+        title: 'Survey notice',
+      },
+      { type: 'text', text: 'Please read this notice. Reply "ok".' },
+    ]);
+    const second = await engine.sendMessage(thread.id, 'What vessel is named in the notice? Reply with the name only.');
+
+    const text = typeof second.content === 'string'
+      ? second.content
+      : second.content.map(b => (b.type === 'text' ? b.text : '')).join('');
+    expect(text.toUpperCase()).toContain('OCEAN TALLY');
+  });
+
+  it('R5 — a cached system prefix is read back on the second identical call', async () => {
+    const adapter = makeAdapter();
+    // Must exceed the model's minimum cacheable length (up to 4096 tokens on
+    // some models). The nonce keeps earlier runs' cache entries from matching.
+    const nonce = `run-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const pack = `Knowledge pack ${nonce}.\n` +
+      Array.from({ length: 400 }, (_, i) =>
+        `Rule ${i}: when inspecting cargo lot ${i}, record the seal number, the container condition, and any water staining.`,
+      ).join('\n');
+
+    const call = () => adapter.send({
+      systemPrompt: [{ text: pack, cacheBreakpoint: true }, { text: 'Assignment context: J-42.' }],
+      messages: [{ role: 'user', content: 'Reply "ok".' }],
+    });
+
+    const first = await call();
+    const second = await call();
+    console.log('  first  — cache write:', first.usage.cacheWriteTokens, 'read:', first.usage.cacheReadTokens);
+    console.log('  second — cache write:', second.usage.cacheWriteTokens, 'read:', second.usage.cacheReadTokens);
+    expect(first.usage.cacheWriteTokens ?? 0).toBeGreaterThan(0);
+    expect(second.usage.cacheReadTokens ?? 0).toBeGreaterThan(0);
+  });
+});

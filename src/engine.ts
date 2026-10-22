@@ -10,6 +10,8 @@ import type {
   ProviderMessage,
   ProviderResponse,
   ProviderStreamChunk,
+  SystemPrompt,
+  ToolChoice,
   ToolDefinition,
 } from './adapters/provider/types.js';
 import type { ContextStrategy } from './context/strategy.js';
@@ -35,14 +37,31 @@ export interface ConversationEngineConfig {
   provider: ProviderAdapter;
   hooks?: EngineHooks;
   contextStrategy?: ContextStrategy;
-  defaultSystemPrompt?: string;
+  defaultSystemPrompt?: SystemPrompt;
 }
 
 export interface AgentLoopOptions {
   tools: ToolDefinition[];
   toolExecutor: ToolExecutor;
-  systemPrompt?: string;
+  systemPrompt?: SystemPrompt;
   maxIterations?: number;
+  /**
+   * A fixed value applies to the FIRST iteration only; later iterations use
+   * the provider default ('auto'). Forcing a tool on every iteration would
+   * leave the model no way to give its final answer, so the loop would run
+   * until MaxIterationsExceededError. For per-iteration control pass a
+   * function — it receives the 1-based iteration number and its result is
+   * used as-is (undefined = provider default).
+   */
+  toolChoice?: ToolChoice | ((iteration: number) => ToolChoice | undefined);
+}
+
+function toolChoiceForIteration(
+  option: AgentLoopOptions['toolChoice'],
+  iteration: number,
+): ToolChoice | undefined {
+  if (typeof option === 'function') return option(iteration);
+  return iteration === 1 ? option : undefined;
 }
 
 export class ConversationEngine {
@@ -50,7 +69,7 @@ export class ConversationEngine {
   private readonly provider: ProviderAdapter;
   private readonly hooks: EngineHooks;
   private readonly strategy: ContextStrategy;
-  private readonly defaultSystemPrompt?: string;
+  private readonly defaultSystemPrompt?: SystemPrompt;
 
   constructor(config: ConversationEngineConfig) {
     this.storage = config.storage;
@@ -83,7 +102,7 @@ export class ConversationEngine {
   async sendMessage(
     threadId: ThreadId,
     userContent: string | ContentBlock[],
-    opts?: { tools?: ToolDefinition[]; systemPrompt?: string },
+    opts?: { tools?: ToolDefinition[]; systemPrompt?: SystemPrompt; toolChoice?: ToolChoice },
   ): Promise<Message> {
     const { thread, userMessage, history } = await this._prepareUserMessage(
       threadId,
@@ -98,6 +117,8 @@ export class ConversationEngine {
       newMessage: userMessage,
       systemPrompt,
       tools: opts?.tools,
+      toolChoice: opts?.toolChoice,
+      iteration: 1,
     };
 
     ctx = await this._runBeforeSend(ctx);
@@ -110,6 +131,7 @@ export class ConversationEngine {
         systemPrompt: ctx.systemPrompt,
         messages,
         tools: ctx.tools,
+        toolChoice: ctx.toolChoice,
       });
     } catch (err) {
       this._callOnError(err, 'provider');
@@ -137,7 +159,7 @@ export class ConversationEngine {
   streamMessage(
     threadId: ThreadId,
     userContent: string | ContentBlock[],
-    opts?: { tools?: ToolDefinition[]; systemPrompt?: string },
+    opts?: { tools?: ToolDefinition[]; systemPrompt?: SystemPrompt },
   ): { stream: AsyncIterable<ProviderStreamChunk>; completion: Promise<Message> } {
     // completion is driven by consuming the stream
     let resolveCompletion!: (msg: Message) => void;
@@ -164,6 +186,7 @@ export class ConversationEngine {
           newMessage: userMessage,
           systemPrompt,
           tools: opts?.tools,
+          iteration: 1,
         };
 
         ctx = await engine._runBeforeSend(ctx);
@@ -176,6 +199,7 @@ export class ConversationEngine {
             systemPrompt: ctx.systemPrompt,
             messages,
             tools: ctx.tools,
+            toolChoice: ctx.toolChoice,
           });
         } catch (err) {
           engine._callOnError(err, 'provider');
@@ -270,6 +294,8 @@ export class ConversationEngine {
         newMessage: currentMessage,
         systemPrompt,
         tools: opts.tools,
+        toolChoice: toolChoiceForIteration(opts.toolChoice, iteration),
+        iteration,
       };
 
       ctx = await this._runBeforeSend(ctx);
@@ -282,6 +308,7 @@ export class ConversationEngine {
           systemPrompt: ctx.systemPrompt,
           messages,
           tools: ctx.tools,
+          toolChoice: ctx.toolChoice,
         });
       } catch (err) {
         this._callOnError(err, 'provider');
@@ -389,6 +416,8 @@ export class ConversationEngine {
             newMessage: currentMessage,
             systemPrompt,
             tools: opts.tools,
+            toolChoice: toolChoiceForIteration(opts.toolChoice, iteration),
+            iteration,
           };
 
           ctx = await engine._runBeforeSend(ctx);
@@ -401,6 +430,7 @@ export class ConversationEngine {
               systemPrompt: ctx.systemPrompt,
               messages,
               tools: ctx.tools,
+              toolChoice: ctx.toolChoice,
             });
           } catch (err) {
             engine._callOnError(err, 'provider');

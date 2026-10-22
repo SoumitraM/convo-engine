@@ -5,18 +5,27 @@
  * (IBM TADN cluster — Qwen/Granite models). Implements send() and stream().
  *
  * cacheBreakpoint markers on ProviderMessages are silently ignored — the gateway
- * has no prompt-caching mechanism.
+ * has no prompt-caching mechanism. System prompt blocks are joined.
+ * toolChoice is forwarded in OpenAI format; a gateway that rejects it returns
+ * a 4xx, surfaced as InvalidRequestError.
+ * Text documents are inlined as text; image and PDF blocks are rejected.
+ * HTTP and network failures are thrown as ProviderError subclasses.
  */
 
 import https from 'node:https';
 import type {
   ProviderAdapter,
+  ProviderInput,
   ProviderMessage,
   ProviderResponse,
   ProviderStreamChunk,
+  SystemPrompt,
+  ToolChoice,
   ToolDefinition,
 } from './types.js';
 import type { ContentBlock } from '../../types.js';
+import { InvalidRequestError, ProviderError, classifyProviderError } from '../../errors.js';
+import { documentAsText, flattenSystemPrompt, validateToolChoice } from './shared.js';
 
 // ---------------------------------------------------------------------------
 // Options & class
@@ -31,6 +40,10 @@ export interface GatewayProviderAdapterOptions {
   model?: string;
   /** Set false to disable TLS cert validation (self-signed cert). Default: true. Node.js only. */
   tlsRejectUnauthorized?: boolean;
+  /** Request timeout in milliseconds (for stream(), covers the whole stream). Default: none. */
+  timeoutMs?: number;
+  /** Sampling temperature. Omitted from the request when unset. */
+  temperature?: number;
 }
 
 export class GatewayProviderAdapter implements ProviderAdapter {
@@ -38,6 +51,8 @@ export class GatewayProviderAdapter implements ProviderAdapter {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly agent: https.Agent | undefined;
+  private readonly timeoutMs?: number;
+  private readonly temperature?: number;
 
   constructor(options: GatewayProviderAdapterOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '');
@@ -46,32 +61,24 @@ export class GatewayProviderAdapter implements ProviderAdapter {
     this.agent   = options.tlsRejectUnauthorized === false
       ? new https.Agent({ rejectUnauthorized: false })
       : undefined;
+    this.timeoutMs   = options.timeoutMs;
+    this.temperature = options.temperature;
   }
 
   // -------------------------------------------------------------------------
   // send() — non-streaming
   // -------------------------------------------------------------------------
 
-  async send(input: {
-    systemPrompt?: string;
-    messages: ProviderMessage[];
-    tools?: ToolDefinition[];
-  }): Promise<ProviderResponse> {
+  async send(input: ProviderInput): Promise<ProviderResponse> {
     const body = this.buildRequestBody(input, false);
+    const response = await this.post(body);
 
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(body),
-      ...(this.agent ? { agent: this.agent } : {}),
-    } as RequestInit);
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`GatewayProviderAdapter: HTTP ${response.status} — ${text}`);
+    let completion: Record<string, unknown>;
+    try {
+      completion = await response.json() as Record<string, unknown>;
+    } catch (err) {
+      throw toNetworkError(err);
     }
-
-    const completion = await response.json() as Record<string, unknown>;
     return this.parseResponse(completion);
   }
 
@@ -79,24 +86,9 @@ export class GatewayProviderAdapter implements ProviderAdapter {
   // stream() — SSE streaming
   // -------------------------------------------------------------------------
 
-  async *stream(input: {
-    systemPrompt?: string;
-    messages: ProviderMessage[];
-    tools?: ToolDefinition[];
-  }): AsyncIterable<ProviderStreamChunk> {
+  async *stream(input: ProviderInput): AsyncIterable<ProviderStreamChunk> {
     const body = this.buildRequestBody(input, true);
-
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(body),
-      ...(this.agent ? { agent: this.agent } : {}),
-    } as RequestInit);
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`GatewayProviderAdapter: HTTP ${response.status} — ${text}`);
-    }
+    const response = await this.post(body);
 
     if (!response.body) {
       throw new Error('GatewayProviderAdapter: response body is null (streaming)');
@@ -112,7 +104,13 @@ export class GatewayProviderAdapter implements ProviderAdapter {
     let   leftover = '';
 
     while (true) {
-      const { value, done } = await reader.read();
+      let value: Uint8Array | undefined;
+      let done: boolean;
+      try {
+        ({ value, done } = await reader.read());
+      } catch (err) {
+        throw toNetworkError(err);
+      }
       if (done) break;
 
       const chunk = leftover + decoder.decode(value, { stream: true });
@@ -141,6 +139,17 @@ export class GatewayProviderAdapter implements ProviderAdapter {
 
         let parsed: Record<string, unknown>;
         try { parsed = JSON.parse(payload) as Record<string, unknown>; } catch { continue; }
+
+        // An error reported mid-stream, after the 200 response
+        if (parsed.error !== undefined) {
+          const { message, errorType, status } = describeErrorBody(parsed);
+          throw classifyProviderError({
+            provider: 'gateway',
+            message:  `GatewayProviderAdapter: stream error — ${message ?? payload}`,
+            status,
+            errorType,
+          });
+        }
 
         const choices = parsed.choices as Record<string, unknown>[] | undefined;
         const delta   = choices?.[0]?.delta as Record<string, unknown> | undefined;
@@ -189,34 +198,68 @@ export class GatewayProviderAdapter implements ProviderAdapter {
   // Private helpers
   // -------------------------------------------------------------------------
 
+  /** POSTs to the chat completions endpoint; non-2xx and network failures throw ProviderErrors. */
+  private async post(body: Record<string, unknown>): Promise<Response> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(body),
+        ...(this.agent ? { agent: this.agent } : {}),
+        ...(this.timeoutMs !== undefined ? { signal: AbortSignal.timeout(this.timeoutMs) } : {}),
+      } as RequestInit);
+    } catch (err) {
+      throw toNetworkError(err);
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      let errorType: string | undefined;
+      try {
+        errorType = describeErrorBody(JSON.parse(text) as Record<string, unknown>).errorType;
+      } catch { /* not JSON */ }
+      throw classifyProviderError({
+        provider: 'gateway',
+        message:  `GatewayProviderAdapter: HTTP ${response.status} — ${text}`,
+        status:   response.status,
+        errorType,
+        headers:  response.headers,
+      });
+    }
+
+    return response;
+  }
+
   private buildHeaders(): Record<string, string> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
     return headers;
   }
 
-  private buildRequestBody(
-    input: { systemPrompt?: string; messages: ProviderMessage[]; tools?: ToolDefinition[] },
-    streaming: boolean,
-  ): Record<string, unknown> {
+  private buildRequestBody(input: ProviderInput, streaming: boolean): Record<string, unknown> {
+    validateToolChoice('gateway', input.toolChoice, input.tools);
+
     const messages = this.translateMessages(input.systemPrompt, input.messages);
     const body: Record<string, unknown> = { model: this.model, messages };
     if (streaming) body.stream = true;
     if (input.tools && input.tools.length > 0) {
       body.tools       = this.translateTools(input.tools);
-      body.tool_choice = 'auto';
+      body.tool_choice = translateToolChoice(input.toolChoice);
     }
+    if (this.temperature !== undefined) body.temperature = this.temperature;
     return body;
   }
 
   private translateMessages(
-    systemPrompt: string | undefined,
+    systemPrompt: SystemPrompt | undefined,
     messages: ProviderMessage[],
   ): unknown[] {
     const result: unknown[] = [];
 
-    if (systemPrompt) {
-      result.push({ role: 'system', content: systemPrompt });
+    const system = flattenSystemPrompt(systemPrompt);
+    if (system) {
+      result.push({ role: 'system', content: system });
     }
 
     for (const msg of messages) {
@@ -238,7 +281,19 @@ export class GatewayProviderAdapter implements ProviderAdapter {
         } else if (block.type === 'tool_result') {
           toolResultBlocks.push(block);
         } else if (block.type === 'image') {
-          throw new Error('GatewayProviderAdapter: image content blocks are not supported by this provider.');
+          throw new InvalidRequestError(
+            'GatewayProviderAdapter: image content blocks are not supported by this provider.',
+            { provider: 'gateway' },
+          );
+        } else if (block.type === 'document') {
+          if (block.source.type !== 'text') {
+            throw new InvalidRequestError(
+              'GatewayProviderAdapter: PDF document blocks are not supported by this provider ' +
+              '(text documents are).',
+              { provider: 'gateway' },
+            );
+          }
+          textParts.push(documentAsText(block));
         }
       }
 
@@ -321,6 +376,45 @@ export class GatewayProviderAdapter implements ProviderAdapter {
       usage:      { inputTokens, outputTokens },
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Module helpers
+// ---------------------------------------------------------------------------
+
+function translateToolChoice(toolChoice: ToolChoice | undefined): unknown {
+  if (toolChoice === undefined || toolChoice === 'auto') return 'auto';
+  if (toolChoice === 'any') return 'required';
+  if (toolChoice === 'none') return 'none';
+  return { type: 'function', function: { name: toolChoice.name } };
+}
+
+/** Pulls message / code out of an OpenAI-style `{ error: ... }` body. */
+function describeErrorBody(body: Record<string, unknown>): {
+  message?: string; errorType?: string; status?: number;
+} {
+  const error = body.error;
+  if (typeof error === 'string') return { message: error };
+  if (typeof error !== 'object' || error === null) return {};
+  const e = error as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : undefined);
+  const code = e.code;
+  return {
+    message:   str(e.message),
+    errorType: str(code) ?? str(e.type),
+    status:    typeof code === 'number' ? code : undefined,
+  };
+}
+
+/** fetch() rejects with TypeError on network failure and TimeoutError on AbortSignal.timeout. */
+function toNetworkError(err: unknown): ProviderError {
+  if (err instanceof ProviderError) return err;
+  const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return new ProviderError(`GatewayProviderAdapter: request failed — ${detail}`, {
+    provider:  'gateway',
+    cause:     err,
+    retryable: true,
+  });
 }
 
 // ---------------------------------------------------------------------------

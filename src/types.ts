@@ -15,7 +15,23 @@ export type ContentBlock =
   | { type: 'text';        text: string }
   | { type: 'tool_use';    id: string; name: string; input: Record<string, unknown> }
   | { type: 'tool_result'; tool_use_id: string; content: string }
-  | { type: 'image';       source: { type: 'base64'; media_type: string; data: string } };
+  | { type: 'image';       source: { type: 'base64'; media_type: string; data: string } }
+  | {
+      type: 'document';
+      source: DocumentSource;
+      /** e.g. "Bill of lading B/L 123" — helps the model refer to the document. */
+      title?: string;
+      /** Optional note passed to the model alongside the document. */
+      context?: string;
+    };
+
+/**
+ * Source of a `document` block. PDFs travel as base64; text sources carry the
+ * text itself (CSV included — spreadsheets are converted to CSV by the caller).
+ */
+export type DocumentSource =
+  | { type: 'base64'; media_type: 'application/pdf'; data: string }
+  | { type: 'text';   media_type: 'text/plain' | 'text/csv'; data: string };
 
 /**
  * Executes a single tool call requested by the model and returns the result.
