@@ -8,6 +8,8 @@ import { ConversationEngine, MaxIterationsExceededError } from '../src/engine.js
 import { InMemoryStorageAdapter } from '../src/adapters/storage/in-memory.js';
 import type { ProviderAdapter, ProviderResponse, ProviderStreamChunk } from '../src/adapters/provider/types.js';
 import type { ContentBlock } from '../src/types.js';
+import type { SendContext } from '../src/hooks/types.js';
+import { RateLimitError } from '../src/errors.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -540,5 +542,209 @@ describe('ConversationEngine.streamAgentLoop', () => {
       MaxIterationsExceededError,
     );
     await expect(completion).rejects.toThrow(MaxIterationsExceededError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R1 — toolChoice through the engine, F1 — SendContext.iteration
+// ---------------------------------------------------------------------------
+
+const TOOL = { name: 'tool_a', description: 'x', inputSchema: {} };
+
+function sentToolChoices(provider: ProviderAdapter, method: 'send' | 'stream' = 'send') {
+  return vi.mocked(provider[method]).mock.calls.map(c => c[0].toolChoice);
+}
+
+describe('ConversationEngine toolChoice', () => {
+  it('sendMessage passes toolChoice to the provider', async () => {
+    const provider = makeMockProvider([makeToolUseResponse('c1', 'tool_a', {})]);
+    const engine = new ConversationEngine({ storage: new InMemoryStorageAdapter(), provider });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    await engine.sendMessage(thread.id, 'Go', { tools: [TOOL], toolChoice: { type: 'tool', name: 'tool_a' } });
+
+    expect(sentToolChoices(provider)).toEqual([{ type: 'tool', name: 'tool_a' }]);
+  });
+
+  it('agentLoop applies a fixed toolChoice to the first iteration only', async () => {
+    const provider = makeMockProvider([
+      makeToolUseResponse('c1', 'tool_a', {}),
+      makeToolUseResponse('c2', 'tool_a', {}),
+      makeTextResponse('Done.'),
+    ]);
+    const engine = new ConversationEngine({ storage: new InMemoryStorageAdapter(), provider });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    const final = await engine.agentLoop(thread.id, 'Go', {
+      tools: [TOOL],
+      toolExecutor: async () => 'ok',
+      toolChoice: 'any',
+    });
+
+    expect(final.content).toEqual([{ type: 'text', text: 'Done.' }]);
+    expect(sentToolChoices(provider)).toEqual(['any', undefined, undefined]);
+  });
+
+  it('agentLoop accepts a per-iteration function', async () => {
+    const provider = makeMockProvider([
+      makeToolUseResponse('c1', 'tool_a', {}),
+      makeToolUseResponse('c2', 'tool_a', {}),
+      makeTextResponse('Done.'),
+    ]);
+    const engine = new ConversationEngine({ storage: new InMemoryStorageAdapter(), provider });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+    const choose = vi.fn((i: number) => (i < 3 ? { type: 'tool' as const, name: 'tool_a' } : 'none' as const));
+
+    await engine.agentLoop(thread.id, 'Go', { tools: [TOOL], toolExecutor: async () => 'ok', toolChoice: choose });
+
+    expect(choose.mock.calls.map(c => c[0])).toEqual([1, 2, 3]);
+    expect(sentToolChoices(provider)).toEqual([
+      { type: 'tool', name: 'tool_a' },
+      { type: 'tool', name: 'tool_a' },
+      'none',
+    ]);
+  });
+
+  it('streamAgentLoop applies a fixed toolChoice to the first iteration only', async () => {
+    const provider = makeMockStreamingProvider([
+      [
+        { delta: { type: 'tool_use', id: 'c1', name: 'tool_a', input: {} }, done: false },
+        { delta: '', done: true },
+      ],
+      [{ delta: 'Done.', done: false }, { delta: '', done: true }],
+    ]);
+    const engine = new ConversationEngine({ storage: new InMemoryStorageAdapter(), provider });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    const { stream, completion } = engine.streamAgentLoop(thread.id, 'Go', {
+      tools: [TOOL],
+      toolExecutor: async () => 'ok',
+      toolChoice: { type: 'tool', name: 'tool_a' },
+    });
+    for await (const _ of stream) { /* drain */ }
+    await completion;
+
+    expect(sentToolChoices(provider, 'stream')).toEqual([{ type: 'tool', name: 'tool_a' }, undefined]);
+  });
+
+  it('beforeSend sees iteration and the resolved toolChoice, and can override toolChoice', async () => {
+    const provider = makeMockProvider([
+      makeToolUseResponse('c1', 'tool_a', {}),
+      makeTextResponse('Done.'),
+    ]);
+    const seen: Array<Pick<SendContext, 'iteration' | 'toolChoice'> & { newRole: string; isToolResult: boolean }> = [];
+    const engine = new ConversationEngine({
+      storage: new InMemoryStorageAdapter(),
+      provider,
+      hooks: {
+        beforeSend: (ctx) => {
+          seen.push({
+            iteration: ctx.iteration,
+            toolChoice: ctx.toolChoice,
+            newRole: ctx.newMessage.role,
+            isToolResult: Array.isArray(ctx.newMessage.content) &&
+              ctx.newMessage.content.some(b => b.type === 'tool_result'),
+          });
+          return ctx.iteration === 2 ? { ...ctx, toolChoice: 'none' } : ctx;
+        },
+      },
+    });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    await engine.agentLoop(thread.id, 'Go', { tools: [TOOL], toolExecutor: async () => 'ok', toolChoice: 'any' });
+
+    expect(seen).toEqual([
+      { iteration: 1, toolChoice: 'any', newRole: 'user', isToolResult: false },
+      { iteration: 2, toolChoice: undefined, newRole: 'user', isToolResult: true },
+    ]);
+    expect(sentToolChoices(provider)).toEqual(['any', 'none']);
+  });
+
+  it('iteration is 1 for sendMessage and streamMessage', async () => {
+    const iterations: number[] = [];
+    const engine = new ConversationEngine({
+      storage: new InMemoryStorageAdapter(),
+      provider: makeMockProvider([makeTextResponse('ok')]),
+      hooks: { beforeSend: (ctx) => { iterations.push(ctx.iteration); return ctx; } },
+    });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    await engine.sendMessage(thread.id, 'a');
+    const { stream, completion } = engine.streamMessage(thread.id, 'b');
+    for await (const _ of stream) { /* drain */ }
+    await completion;
+
+    expect(iterations).toEqual([1, 1]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — document blocks in a thread
+// ---------------------------------------------------------------------------
+
+describe('ConversationEngine document blocks', () => {
+  it('persists a document message and replays it to the provider on the next turn', async () => {
+    const storage = new InMemoryStorageAdapter();
+    const provider = makeMockProvider([makeTextResponse('Read it.'), makeTextResponse('40 bags.')]);
+    const engine = new ConversationEngine({ storage, provider });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    const pdf: ContentBlock = {
+      type: 'document',
+      source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0x' },
+      title: 'B/L 123',
+    };
+    const csv: ContentBlock = {
+      type: 'document',
+      source: { type: 'text', media_type: 'text/csv', data: 'item,qty\nbags,40' },
+      title: 'Tally',
+    };
+
+    await engine.sendMessage(thread.id, [pdf, csv, { type: 'text', text: 'Read these.' }]);
+    await engine.sendMessage(thread.id, 'How many bags?');
+
+    const history = await engine.getHistory(thread.id);
+    expect(history[0].content).toEqual([pdf, csv, { type: 'text', text: 'Read these.' }]);
+
+    const secondCall = vi.mocked(provider.send).mock.calls[1][0];
+    expect(secondCall.messages[0].content).toEqual([pdf, csv, { type: 'text', text: 'Read these.' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R5 — system prompt blocks, R3 — typed errors through the engine
+// ---------------------------------------------------------------------------
+
+describe('ConversationEngine system prompt blocks and errors', () => {
+  it('passes system prompt blocks (default and per-call) through unchanged', async () => {
+    const provider = makeMockProvider([makeTextResponse('ok')]);
+    const defaultBlocks = [{ text: 'Pack', cacheBreakpoint: true }, { text: 'Today is 2026-10-22' }];
+    const engine = new ConversationEngine({
+      storage: new InMemoryStorageAdapter(),
+      provider,
+      defaultSystemPrompt: defaultBlocks,
+    });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    await engine.sendMessage(thread.id, 'a');
+    await engine.sendMessage(thread.id, 'b', { systemPrompt: [{ text: 'Other', cacheBreakpoint: true }] });
+
+    const calls = vi.mocked(provider.send).mock.calls;
+    expect(calls[0][0].systemPrompt).toEqual(defaultBlocks);
+    expect(calls[1][0].systemPrompt).toEqual([{ text: 'Other', cacheBreakpoint: true }]);
+  });
+
+  it('provider errors reach the caller as the same typed instance, and onError sees it', async () => {
+    const rateLimited = new RateLimitError('429', { provider: 'claude', status: 429, retryAfterMs: 1000 });
+    const provider: ProviderAdapter = {
+      send: vi.fn(async () => { throw rateLimited; }),
+      stream: vi.fn(),
+    };
+    const onError = vi.fn();
+    const engine = new ConversationEngine({ storage: new InMemoryStorageAdapter(), provider, hooks: { onError } });
+    const thread = await engine.createThread({ type: 'test', ownerId: 'u1' });
+
+    await expect(engine.sendMessage(thread.id, 'Hi')).rejects.toBe(rateLimited);
+    expect(onError).toHaveBeenCalledWith(rateLimited, 'provider');
   });
 });

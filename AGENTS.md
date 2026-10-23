@@ -33,6 +33,8 @@ All test files live in `tests/` at the package root (not co-located with source)
 The following files must have **zero imports from npm** (enforced by code review, not linter):
 - `src/engine.ts`
 - `src/types.ts`
+- `src/errors.ts`
+- `src/adapters/provider/shared.ts` (bundled into every adapter entry point)
 - `src/context/strategy.ts`
 - `src/hooks/types.ts`
 - `src/adapters/storage/types.ts`

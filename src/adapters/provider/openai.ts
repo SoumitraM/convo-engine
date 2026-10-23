@@ -8,6 +8,9 @@
  * prompt-caching mechanism at this time.
  * tool_result ContentBlocks are emitted as standalone role:'tool' messages.
  * Streaming tool calls are buffered and flushed as a single chunk.
+ * Image and PDF blocks become image_url / file content parts (user messages
+ * only); text documents are inlined as text. System prompt blocks are joined.
+ * SDK errors are rethrown as ProviderError subclasses (see src/errors.ts).
  */
 
 // eslint-disable-next-line import/no-extraneous-dependencies
@@ -15,71 +18,91 @@ import OpenAI from 'openai';
 
 import type {
   ProviderAdapter,
+  ProviderInput,
   ProviderMessage,
   ProviderResponse,
   ProviderStreamChunk,
+  SystemPrompt,
+  ToolChoice,
   ToolDefinition,
 } from './types.js';
 import type { ContentBlock } from '../../types.js';
+import { InvalidRequestError } from '../../errors.js';
+import { documentAsText, flattenSystemPrompt, mapSdkError, validateToolChoice } from './shared.js';
 
 export interface OpenAIProviderAdapterOptions {
   apiKey: string;
   model?: string;
   maxTokens?: number;
   baseURL?: string;
+  /** SDK-level retries on 408/409/429/5xx and connection errors. SDK default: 2. */
+  maxRetries?: number;
+  /** Per-request timeout in milliseconds. SDK default: 10 minutes. */
+  timeoutMs?: number;
+  /** Sampling temperature. Omitted from the request when unset. */
+  temperature?: number;
 }
 
 export class OpenAIProviderAdapter implements ProviderAdapter {
   private readonly client: OpenAI;
   private readonly model: string;
   private readonly maxTokens: number;
+  private readonly temperature?: number;
 
   constructor(options: OpenAIProviderAdapterOptions) {
     this.client = new OpenAI({
       apiKey: options.apiKey,
       ...(options.baseURL ? { baseURL: options.baseURL } : {}),
+      ...(options.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
+      ...(options.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
     });
     this.model = options.model ?? 'gpt-4o';
     this.maxTokens = options.maxTokens ?? 4096;
+    this.temperature = options.temperature;
   }
 
-  async send(input: {
-    systemPrompt?: string;
-    messages: ProviderMessage[];
-    tools?: ToolDefinition[];
-  }): Promise<ProviderResponse> {
-    const openaiMessages = translateMessages(input.systemPrompt, input.messages);
+  async send(input: ProviderInput): Promise<ProviderResponse> {
+    const params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = this.buildParams(input);
 
-    const params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
-      model: this.model,
-      max_tokens: this.maxTokens,
-      messages: openaiMessages,
-      ...(input.tools && input.tools.length > 0
-        ? { tools: translateTools(input.tools), tool_choice: 'auto' as const }
-        : {}),
-    };
-
-    const response = await this.client.chat.completions.create(params);
+    let response: OpenAI.Chat.ChatCompletion;
+    try {
+      response = await this.client.chat.completions.create(params);
+    } catch (err) {
+      throw mapSdkError('openai', err);
+    }
     return parseResponse(response);
   }
 
-  async *stream(input: {
-    systemPrompt?: string;
-    messages: ProviderMessage[];
-    tools?: ToolDefinition[];
-  }): AsyncIterable<ProviderStreamChunk> {
-    const openaiMessages = translateMessages(input.systemPrompt, input.messages);
-
+  async *stream(input: ProviderInput): AsyncIterable<ProviderStreamChunk> {
     const params: OpenAI.Chat.ChatCompletionCreateParamsStreaming = {
-      model: this.model,
-      max_tokens: this.maxTokens,
-      messages: openaiMessages,
+      ...this.buildParams(input),
       stream: true,
-      ...(input.tools && input.tools.length > 0
-        ? { tools: translateTools(input.tools), tool_choice: 'auto' as const }
-        : {}),
     };
 
+    try {
+      yield* this.streamChunks(params);
+    } catch (err) {
+      throw mapSdkError('openai', err);
+    }
+  }
+
+  private buildParams(input: ProviderInput): OpenAI.Chat.ChatCompletionCreateParamsNonStreaming {
+    validateToolChoice('openai', input.toolChoice, input.tools);
+
+    return {
+      model: this.model,
+      max_tokens: this.maxTokens,
+      messages: translateMessages(input.systemPrompt, input.messages),
+      ...(input.tools && input.tools.length > 0
+        ? { tools: translateTools(input.tools), tool_choice: translateToolChoice(input.toolChoice) }
+        : {}),
+      ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
+    };
+  }
+
+  private async *streamChunks(
+    params: OpenAI.Chat.ChatCompletionCreateParamsStreaming,
+  ): AsyncIterable<ProviderStreamChunk> {
     const stream = await this.client.chat.completions.create(params);
 
     // Buffer for accumulating tool call deltas
@@ -128,15 +151,26 @@ export class OpenAIProviderAdapter implements ProviderAdapter {
 // ---------------------------------------------------------------------------
 
 type OpenAIMessage = OpenAI.Chat.ChatCompletionMessageParam;
+type OpenAIContentPart = OpenAI.Chat.ChatCompletionContentPart;
+
+function translateToolChoice(
+  toolChoice: ToolChoice | undefined,
+): OpenAI.Chat.ChatCompletionToolChoiceOption {
+  if (toolChoice === undefined || toolChoice === 'auto') return 'auto';
+  if (toolChoice === 'any') return 'required';
+  if (toolChoice === 'none') return 'none';
+  return { type: 'function', function: { name: toolChoice.name } };
+}
 
 function translateMessages(
-  systemPrompt: string | undefined,
+  systemPrompt: SystemPrompt | undefined,
   messages: ProviderMessage[],
 ): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
-  if (systemPrompt) {
-    result.push({ role: 'system', content: systemPrompt });
+  const system = flattenSystemPrompt(systemPrompt);
+  if (system) {
+    result.push({ role: 'system', content: system });
   }
 
   for (const msg of messages) {
@@ -149,11 +183,16 @@ function translateMessages(
     const toolUseBlocks: Extract<ContentBlock, { type: 'tool_use' }>[] = [];
     const textParts: string[] = [];
     const toolResultBlocks: Extract<ContentBlock, { type: 'tool_result' }>[] = [];
+    // All non-tool content in order, as content parts — used only when the
+    // message carries an image or PDF (plain text keeps the string form).
+    const parts: OpenAIContentPart[] = [];
+    let hasMedia = false;
 
     for (const block of msg.content) {
       switch (block.type) {
         case 'text':
           textParts.push(block.text);
+          parts.push({ type: 'text', text: block.text });
           break;
         case 'tool_use':
           toolUseBlocks.push(block);
@@ -162,9 +201,36 @@ function translateMessages(
           toolResultBlocks.push(block);
           break;
         case 'image':
-          // OpenAI supports images but we skip for simplicity / spec alignment
+          hasMedia = true;
+          parts.push({
+            type: 'image_url',
+            image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
+          });
+          break;
+        case 'document':
+          if (block.source.type === 'text') {
+            const text = documentAsText(block);
+            textParts.push(text);
+            parts.push({ type: 'text', text });
+          } else {
+            hasMedia = true;
+            parts.push({
+              type: 'file',
+              file: {
+                filename: block.title ?? 'document.pdf',
+                file_data: `data:application/pdf;base64,${block.source.data}`,
+              },
+            });
+          }
           break;
       }
+    }
+
+    if (hasMedia && msg.role !== 'user') {
+      throw new InvalidRequestError(
+        `OpenAIProviderAdapter: image and PDF blocks are only supported in user messages (got role '${msg.role}').`,
+        { provider: 'openai' },
+      );
     }
 
     // Assistant message with tool calls
@@ -181,6 +247,8 @@ function translateMessages(
           },
         })),
       });
+    } else if (hasMedia) {
+      result.push({ role: 'user', content: parts });
     } else if (textParts.length > 0) {
       result.push({ role: msg.role as 'user' | 'assistant', content: textParts.join('\n') });
     }

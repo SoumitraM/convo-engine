@@ -4,14 +4,27 @@
  */
 
 import type { Thread, Message } from '../types.js';
-import type { ProviderResponse, ToolDefinition } from '../adapters/provider/types.js';
+import type {
+  ProviderResponse,
+  SystemPrompt,
+  ToolChoice,
+  ToolDefinition,
+} from '../adapters/provider/types.js';
 
 export interface SendContext {
   thread: Thread;
   history: Message[];
+  /** The message this call answers. In agentLoop iterations after the first
+   *  it is the latest tool_result message, not the user's message. */
   newMessage: Message;
-  systemPrompt?: string;
+  systemPrompt?: SystemPrompt;
   tools?: ToolDefinition[];
+  /** The tool choice for this provider call (agentLoop: already resolved for
+   *  this iteration). A hook may change it. */
+  toolChoice?: ToolChoice;
+  /** 1-based provider-call number within this turn. Always 1 for sendMessage
+   *  and streamMessage; counts up across agentLoop tool round-trips. */
+  iteration: number;
 }
 
 export interface ReceiveContext {

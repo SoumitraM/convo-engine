@@ -5,6 +5,14 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { GatewayProviderAdapter, createGatewayProviderAdapter } from '../src/adapters/provider/gateway.js';
+import {
+  ProviderError,
+  RateLimitError,
+  OverloadedError,
+  AuthenticationError,
+  ContextLengthError,
+  InvalidRequestError,
+} from '../src/errors.js';
 
 // ---------------------------------------------------------------------------
 // Fetch mock helpers
@@ -283,5 +291,163 @@ describe('createGatewayProviderAdapter', () => {
     process.env['LLM_API_KEY']   = 'mykey';
     process.env['LLM_MODEL']     = 'my-model';
     expect(() => createGatewayProviderAdapter()).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R1–R5 additions
+// ---------------------------------------------------------------------------
+
+const OK_COMPLETION = {
+  choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+  usage: { prompt_tokens: 1, completion_tokens: 1 },
+};
+
+function lastBody(): Record<string, any> {
+  const fetchMock = vi.mocked(fetch);
+  const init = fetchMock.mock.calls[fetchMock.mock.calls.length - 1][1] as RequestInit;
+  return JSON.parse(init.body as string);
+}
+
+function mockFetchError(status: number, body: string, headers: Record<string, string> = {}) {
+  vi.stubGlobal('fetch', vi.fn(async () => ({
+    ok: false,
+    status,
+    headers: new Headers(headers),
+    text: vi.fn(async () => body),
+  })));
+}
+
+describe('GatewayProviderAdapter toolChoice, documents, options', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  const tools = [{ name: 'record_facts', description: 'x', inputSchema: { type: 'object' } }];
+
+  it.each([
+    [undefined, 'auto'],
+    ['any', 'required'],
+    ['none', 'none'],
+    [{ type: 'tool', name: 'record_facts' }, { type: 'function', function: { name: 'record_facts' } }],
+  ] as const)('forwards toolChoice %j as %j', async (choice, expected) => {
+    mockFetchJson(OK_COMPLETION);
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    await adapter.send({ messages: [{ role: 'user', content: 'Hi' }], tools, toolChoice: choice });
+    expect(lastBody().tool_choice).toEqual(expected);
+  });
+
+  it('a gateway that rejects tool_choice surfaces as InvalidRequestError', async () => {
+    mockFetchError(400, JSON.stringify({ error: { message: 'tool_choice "required" is not supported' } }));
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    await expect(adapter.send({ messages: [{ role: 'user', content: 'Hi' }], tools, toolChoice: 'any' }))
+      .rejects.toBeInstanceOf(InvalidRequestError);
+  });
+
+  it('inlines text documents and rejects PDFs', async () => {
+    mockFetchJson(OK_COMPLETION);
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    await adapter.send({
+      messages: [{
+        role: 'user',
+        content: [{ type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'B/L 123' }, title: 'BL' }],
+      }],
+    });
+    expect(lastBody().messages[0]).toEqual({
+      role: 'user',
+      content: '<document title="BL" media_type="text/plain">\nB/L 123\n</document>',
+    });
+
+    await expect(adapter.send({
+      messages: [{
+        role: 'user',
+        content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'x' } }],
+      }],
+    })).rejects.toThrow('PDF document blocks are not supported');
+  });
+
+  it('image blocks still throw, now as InvalidRequestError', async () => {
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    await expect(adapter.send({
+      messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } }] }],
+    })).rejects.toBeInstanceOf(InvalidRequestError);
+  });
+
+  it('joins system prompt blocks', async () => {
+    mockFetchJson(OK_COMPLETION);
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    await adapter.send({ systemPrompt: [{ text: 'A', cacheBreakpoint: true }, { text: 'B' }], messages: [{ role: 'user', content: 'Hi' }] });
+    expect(lastBody().messages[0]).toEqual({ role: 'system', content: 'A\n\nB' });
+  });
+
+  it('sends temperature and a timeout signal when configured, neither by default', async () => {
+    mockFetchJson(OK_COMPLETION);
+    await new GatewayProviderAdapter({ baseUrl: 'https://example.com' }).send({ messages: [{ role: 'user', content: 'Hi' }] });
+    let init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
+    expect(lastBody()).not.toHaveProperty('temperature');
+    expect(init.signal).toBeUndefined();
+
+    mockFetchJson(OK_COMPLETION);
+    await new GatewayProviderAdapter({ baseUrl: 'https://example.com', temperature: 0, timeoutMs: 1000 })
+      .send({ messages: [{ role: 'user', content: 'Hi' }] });
+    init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
+    expect(lastBody().temperature).toBe(0);
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+describe('GatewayProviderAdapter error mapping', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  async function sendError(): Promise<unknown> {
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    return adapter.send({ messages: [{ role: 'user', content: 'Hi' }] }).catch(e => e);
+  }
+
+  it('429 → RateLimitError with retryAfterMs, message keeps the status', async () => {
+    mockFetchError(429, 'slow down', { 'Retry-After': '5' });
+    const err = await sendError();
+    expect(err).toBeInstanceOf(RateLimitError);
+    expect((err as RateLimitError).retryAfterMs).toBe(5000);
+    expect((err as RateLimitError).status).toBe(429);
+    expect((err as Error).message).toContain('HTTP 429');
+  });
+
+  it('503 → OverloadedError', async () => {
+    mockFetchError(503, 'unavailable');
+    expect(await sendError()).toBeInstanceOf(OverloadedError);
+  });
+
+  it('401 → AuthenticationError', async () => {
+    mockFetchError(401, 'unauthorized');
+    expect(await sendError()).toBeInstanceOf(AuthenticationError);
+  });
+
+  it('400 with a context-length message → ContextLengthError', async () => {
+    mockFetchError(400, JSON.stringify({
+      error: { message: "This model's maximum context length is 32768 tokens", type: 'BadRequestError' },
+    }));
+    expect(await sendError()).toBeInstanceOf(ContextLengthError);
+  });
+
+  it('network failure → retryable ProviderError with the cause attached', async () => {
+    const cause = new TypeError('fetch failed');
+    vi.stubGlobal('fetch', vi.fn(async () => { throw cause; }));
+    const err = await sendError();
+    expect((err as ProviderError).constructor).toBe(ProviderError);
+    expect((err as ProviderError).retryable).toBe(true);
+    expect((err as ProviderError).cause).toBe(cause);
+  });
+
+  it('an error event mid-stream is thrown as a ProviderError', async () => {
+    mockFetchSse([
+      'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+      'data: {"error":{"message":"rate limited","code":429}}',
+    ]);
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    const chunks: unknown[] = [];
+    const err = await (async () => {
+      for await (const c of adapter.stream({ messages: [{ role: 'user', content: 'Hi' }] })) chunks.push(c);
+    })().catch(e => e);
+    expect(chunks).toEqual([{ delta: 'Hel', done: false }]);
+    expect(err).toBeInstanceOf(RateLimitError);
   });
 });
