@@ -22,7 +22,13 @@ export type {
   ConversationEngineConfig,
   ToolExecutor,
   AgentLoopOptions,
+  SendMessageOptions,
+  StreamMessageOptions,
+  ThinkingOptions,
+  ThinkingHistory,
 } from './engine.js';
+
+export { applyThinkingHistory } from './context/thinking-history.js';
 
 // ── Core types ────────────────────────────────────────────────────────────
 export type {
@@ -43,6 +49,8 @@ export {
   ContextLengthError,
   AuthenticationError,
   InvalidRequestError,
+  RefusalError,
+  IncompleteResponseError,
 } from './errors.js';
 
 export type { ProviderName, ProviderErrorOptions } from './errors.js';
@@ -64,6 +72,10 @@ export type {
   ToolChoice,
   SystemPrompt,
   SystemPromptBlock,
+  ThinkingConfig,
+  Effort,
+  BlockBinding,
+  InputTransformation,
 } from './adapters/provider/types.js';
 
 // ── Context strategy ───────────────────────────────────────────────────────
@@ -74,6 +86,7 @@ export type {
   EngineHooks,
   SendContext,
   ReceiveContext,
+  ProviderCallContext,
 } from './hooks/types.js';
 
 // ── Gateway adapter — no peer dep, safe to re-export from root ────────────

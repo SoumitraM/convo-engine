@@ -13,12 +13,16 @@
 import Anthropic from '@anthropic-ai/sdk';
 
 import type {
+  BlockBinding,
+  Effort,
+  InputTransformation,
   ProviderAdapter,
   ProviderInput,
   ProviderMessage,
   ProviderResponse,
   ProviderStreamChunk,
   SystemPrompt,
+  ThinkingConfig,
   ToolChoice,
   ToolDefinition,
 } from './types.js';
@@ -41,6 +45,20 @@ export interface ClaudeProviderAdapterOptions {
    * 400 on every model.
    */
   temperature?: number;
+  /**
+   * Default thinking setting; omitted from the request when unset (the model's
+   * own default applies — adaptive on the 5.x models). Overridable per call.
+   */
+  thinking?: ThinkingConfig;
+  /** Default `output_config.effort`; omitted when unset. Overridable per call. */
+  effort?: Effort;
+  /**
+   * Sends `thinking.block_binding.prefix_mismatch_behavior` with the
+   * `thinking-binding-controls-2026-08-01` beta header. Requires adaptive
+   * thinking (sent as `{ type: 'adaptive' }` when `thinking` is unset).
+   * Overridable per call.
+   */
+  blockBinding?: BlockBinding;
 }
 
 /** Anthropic's maximum request size. Base64 payloads (PDFs, images) count toward it. */
@@ -49,11 +67,20 @@ export const CLAUDE_MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 /** Anthropic allows at most this many cache_control breakpoints per request. */
 const MAX_CACHE_BREAKPOINTS = 4;
 
+const BLOCK_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+
+/** Blocks that can't carry cache_control, so a breakpoint goes on the block before them. */
+const NO_CACHE_CONTROL = new Set(['thinking', 'redacted_thinking']);
+
 export class ClaudeProviderAdapter implements ProviderAdapter {
+  readonly name = 'claude' as const;
   private readonly client: Anthropic;
   private readonly model: string;
   private readonly maxTokens: number;
   private readonly temperature?: number;
+  private readonly thinking?: ThinkingConfig;
+  private readonly effort?: Effort;
+  private readonly blockBinding?: BlockBinding;
 
   constructor(options: ClaudeProviderAdapterOptions) {
     this.client = new Anthropic({
@@ -64,14 +91,20 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     this.model = options.model ?? 'claude-haiku-4-5-20251001';
     this.maxTokens = options.maxTokens ?? 8192;
     this.temperature = options.temperature;
+    this.thinking = options.thinking;
+    this.effort = options.effort;
+    this.blockBinding = options.blockBinding;
   }
 
   async send(input: ProviderInput): Promise<ProviderResponse> {
-    const params = this.buildParams(input) as unknown as Anthropic.MessageCreateParamsNonStreaming;
+    const { params, headers } = this.buildParams(input);
 
     let response: Anthropic.Message;
     try {
-      response = await this.client.messages.create(params);
+      response = await this.client.messages.create(
+        params as unknown as Anthropic.MessageCreateParamsNonStreaming,
+        headers ? { headers } : undefined,
+      );
     } catch (err) {
       throw mapSdkError('claude', err);
     }
@@ -80,54 +113,94 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   async *stream(input: ProviderInput): AsyncIterable<ProviderStreamChunk> {
-    const params = {
-      ...this.buildParams(input),
-      stream: true,
-    } as unknown as Anthropic.MessageCreateParamsStreaming;
+    const { params, headers } = this.buildParams(input);
 
+    let response: ProviderResponse;
     try {
-      const stream = this.client.messages.stream(params);
+      const stream = this.client.messages.stream(
+        { ...params, stream: true } as unknown as Anthropic.MessageCreateParamsStreaming,
+        headers ? { headers } : undefined,
+      );
 
-      for await (const event of stream) {
-        if (
-          event.type === 'content_block_delta' &&
-          event.delta.type === 'text_delta'
-        ) {
-          yield { delta: event.delta.text, done: false };
+      // Thinking text and signatures arrive as thinking_delta / signature_delta
+      // events, which older SDKs leave out of finalMessage(). Accumulate them
+      // here so the signature survives whatever SDK version is installed.
+      const thinkingByIndex = new Map<number, { thinking: string; signature: string }>();
+      // Older SDKs also don't copy message_delta's stop_details into finalMessage().
+      let streamedStopDetails: Record<string, unknown> | undefined;
+
+      for await (const rawEvent of stream) {
+        const event = rawEvent as unknown as StreamEvent;
+        if (event.type === 'content_block_start') {
+          const block = event.content_block ?? {};
+          if (block['type'] === 'thinking') {
+            thinkingByIndex.set(event.index ?? 0, {
+              thinking: typeof block['thinking'] === 'string' ? block['thinking'] : '',
+              signature: typeof block['signature'] === 'string' ? block['signature'] : '',
+            });
+          }
+          if (block['type'] === 'thinking' || block['type'] === 'redacted_thinking') {
+            yield { delta: '', done: false, thinking: true };
+          }
+        } else if (event.type === 'content_block_delta') {
+          const delta = event.delta ?? {};
+          if (delta['type'] === 'text_delta' && typeof delta['text'] === 'string') {
+            yield { delta: delta['text'], done: false };
+          } else if (delta['type'] === 'thinking_delta' && typeof delta['thinking'] === 'string') {
+            const acc = thinkingByIndex.get(event.index ?? 0);
+            if (acc) acc.thinking += delta['thinking'];
+            if (delta['thinking']) {
+              yield { delta: '', done: false, thinking: true, thinkingDelta: delta['thinking'] };
+            }
+          } else if (delta['type'] === 'signature_delta' && typeof delta['signature'] === 'string') {
+            const acc = thinkingByIndex.get(event.index ?? 0);
+            if (acc) acc.signature += delta['signature'];
+          }
+        } else if (event.type === 'message_delta') {
+          const details = event.delta?.['stop_details'];
+          if (details && typeof details === 'object') {
+            streamedStopDetails = details as Record<string, unknown>;
+          }
         }
       }
 
       // Tool calls arrive as input_json_delta events accumulated across the
       // stream — rather than re-parsing those ourselves, use the SDK's own
-      // accumulation and pull tool_use blocks out of the finished message.
+      // accumulation and pull the blocks out of the finished message.
       const finalMessage = await stream.finalMessage();
-      for (const block of finalMessage.content) {
-        if (block.type === 'tool_use') {
-          yield {
-            delta: {
-              type: 'tool_use',
-              id: block.id,
-              name: block.name,
-              input: block.input as Record<string, unknown>,
-            },
-            done: false,
-          };
-        }
-      }
+      const finalRaw = finalMessage as unknown as Record<string, unknown>;
+      response = translateResponse(
+        (finalRaw['stop_details'] || !streamedStopDetails
+          ? finalMessage
+          : { ...finalRaw, stop_details: streamedStopDetails }) as Anthropic.Message,
+        thinkingByIndex,
+      );
     } catch (err) {
       // Includes errors that arrive mid-stream (e.g. overloaded_error events).
       throw mapSdkError('claude', err);
     }
 
-    yield { delta: '', done: true };
+    for (const block of response.content) {
+      if (block.type === 'tool_use') yield { delta: block, done: false };
+    }
+
+    yield { delta: '', done: true, response };
   }
 
   /**
    * Request fields shared by send() and stream(). Validation happens here, so
    * invalid input fails before anything is sent.
    */
-  private buildParams(input: ProviderInput): Record<string, unknown> {
+  private buildParams(input: ProviderInput): {
+    params: Record<string, unknown>;
+    headers?: Record<string, string>;
+  } {
     validateToolChoice('claude', input.toolChoice, input.tools);
+    const thinking = buildThinking(
+      input.thinking ?? this.thinking,
+      input.blockBinding ?? this.blockBinding,
+    );
+    const effort = input.effort ?? this.effort;
 
     const { anthropicMessages, systemBlocks } = translateMessages(
       input.systemPrompt,
@@ -137,7 +210,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
     const hasTools = input.tools !== undefined && input.tools.length > 0;
 
-    return {
+    const params = {
       model: this.model,
       max_tokens: this.maxTokens,
       messages: anthropicMessages,
@@ -147,8 +220,36 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         ? { tool_choice: translateToolChoice(input.toolChoice) }
         : {}),
       ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
+      ...(thinking ? { thinking } : {}),
+      ...(effort !== undefined ? { output_config: { effort } } : {}),
     };
+
+    // The beta header goes in request options rather than via
+    // client.beta.messages, which older 0.x SDKs don't have.
+    return thinking && 'block_binding' in thinking
+      ? { params, headers: { 'anthropic-beta': BLOCK_BINDING_BETA } }
+      : { params };
   }
+}
+
+/** The request's `thinking` field, or undefined to leave it out. */
+function buildThinking(
+  thinking: ThinkingConfig | undefined,
+  blockBinding: BlockBinding | undefined,
+): Record<string, unknown> | undefined {
+  if (blockBinding === undefined) return thinking ? { ...thinking } : undefined;
+
+  if (thinking && thinking.type !== 'adaptive') {
+    throw new InvalidRequestError(
+      `blockBinding requires adaptive thinking; got thinking.type '${thinking.type}'.`,
+      { provider: 'claude' },
+    );
+  }
+  return {
+    type: 'adaptive',
+    ...(thinking?.display !== undefined ? { display: thinking.display } : {}),
+    block_binding: { prefix_mismatch_behavior: blockBinding },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -175,17 +276,24 @@ function translateMessages(
     ...(b.cacheBreakpoint ? { cache_control: { type: 'ephemeral' } } : {}),
   }));
 
-  const anthropicMessages: AnthropicMessage[] = messages.map((msg, idx) => {
+  const anthropicMessages: AnthropicMessage[] = [];
+
+  messages.forEach((msg, idx) => {
     const isLast = idx === messages.length - 1;
     const withCache = msg.cacheBreakpoint && !isLast; // breakpoint on last before new msg
 
     if (typeof msg.content === 'string') {
+      if (msg.content.trim() === '') {
+        rejectOrSkipEmpty(msg, idx);
+        return;
+      }
       const block: Anthropic.TextBlockParam & { cache_control?: { type: 'ephemeral' } } = {
         type: 'text',
         text: msg.content,
         ...(withCache ? { cache_control: { type: 'ephemeral' } } : {}),
       };
-      return { role: msg.role as 'user' | 'assistant', content: [block] };
+      anthropicMessages.push({ role: msg.role as 'user' | 'assistant', content: [block] });
+      return;
     }
 
     // ContentBlock[]
@@ -195,7 +303,9 @@ function translateMessages(
     for (const block of msg.content) {
       switch (block.type) {
         case 'text': {
-          blocks.push({ type: 'text', text: block.text });
+          // The API rejects empty text blocks (0.3.0 stored one for every
+          // thinking block it didn't recognise).
+          if (block.text.trim() !== '') blocks.push({ type: 'text', text: block.text });
           break;
         }
         case 'tool_use': {
@@ -238,20 +348,65 @@ function translateMessages(
           });
           break;
         }
+        // Sent back exactly as received — the signature covers the text, and
+        // an empty `thinking` is normal (display 'omitted').
+        case 'thinking': {
+          blocks.push({ type: 'thinking', thinking: block.thinking, signature: block.signature });
+          break;
+        }
+        case 'redacted_thinking': {
+          blocks.push({ type: 'redacted_thinking', data: block.data });
+          break;
+        }
+        case 'provider_raw': {
+          if (block.provider === 'claude') blocks.push({ ...block.block } as AnyBlock);
+          break;
+        }
+        default: {
+          const unknownBlock: never = block;
+          throw new InvalidRequestError(
+            `Unsupported content block type '${(unknownBlock as { type: string }).type}'.`,
+            { provider: 'claude' },
+          );
+        }
       }
     }
 
-    // Apply cache_control to the last block of this message if cacheBreakpoint is set
-    if (msg.cacheBreakpoint && blocks.length > 0) {
-      (blocks[blocks.length - 1] as Record<string, unknown>)['cache_control'] = {
-        type: 'ephemeral',
-      };
+    if (blocks.length === 0) {
+      rejectOrSkipEmpty(msg, idx);
+      return;
     }
 
-    return { role: msg.role as 'user' | 'assistant', content: blocks as unknown as Anthropic.MessageParam['content'] };
+    // Apply cache_control to the last block that can carry it.
+    if (msg.cacheBreakpoint) {
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        if (!NO_CACHE_CONTROL.has(blocks[i].type)) {
+          blocks[i]['cache_control'] = { type: 'ephemeral' };
+          break;
+        }
+      }
+    }
+
+    anthropicMessages.push({
+      role: msg.role as 'user' | 'assistant',
+      content: blocks as unknown as Anthropic.MessageParam['content'],
+    });
   });
 
   return { anthropicMessages, systemBlocks };
+}
+
+/**
+ * A message with nothing left to send. An assistant message is dropped — it
+ * carried nothing the model can use (e.g. a 0.3.0-era `[{ text: '' }]`), and
+ * the API merges the user turns around it. Anything else is a caller error.
+ */
+function rejectOrSkipEmpty(msg: ProviderMessage, idx: number): void {
+  if (msg.role === 'assistant') return;
+  throw new InvalidRequestError(
+    `messages[${idx}] (role '${msg.role}') has no content to send — empty text blocks are not allowed.`,
+    { provider: 'claude' },
+  );
 }
 
 /**
@@ -302,27 +457,64 @@ function translateTools(tools: ToolDefinition[]): Anthropic.Tool[] {
   }));
 }
 
-function translateResponse(response: Anthropic.Message): ProviderResponse {
-  const content: ContentBlock[] = response.content.map(block => {
-    if (block.type === 'text') {
-      return { type: 'text', text: block.text };
+/** The subset of raw stream events stream() reads. */
+interface StreamEvent {
+  type: string;
+  index?: number;
+  content_block?: Record<string, unknown>;
+  delta?: Record<string, unknown>;
+}
+
+function translateResponse(
+  response: Anthropic.Message,
+  streamedThinking?: Map<number, { thinking: string; signature: string }>,
+): ProviderResponse {
+  const raw = response as unknown as Record<string, unknown>;
+  const rawBlocks = response.content as unknown as Record<string, unknown>[];
+
+  const content: ContentBlock[] = rawBlocks.map((block, index) => {
+    switch (block['type']) {
+      case 'text':
+        return { type: 'text', text: block['text'] as string };
+      case 'tool_use':
+        return {
+          type: 'tool_use',
+          id: block['id'] as string,
+          name: block['name'] as string,
+          input: block['input'] as Record<string, unknown>,
+        };
+      case 'thinking': {
+        const streamed = streamedThinking?.get(index);
+        return {
+          type: 'thinking',
+          thinking: streamed?.thinking || (block['thinking'] as string | undefined) || '',
+          signature: streamed?.signature || (block['signature'] as string | undefined) || '',
+        };
+      }
+      case 'redacted_thinking':
+        return { type: 'redacted_thinking', data: block['data'] as string };
+      default:
+        // Kept verbatim so it can be sent back unchanged — dropping a block
+        // from the middle of a turn can invalidate later thinking blocks.
+        return { type: 'provider_raw', provider: 'claude', block: { ...block } };
     }
-    if (block.type === 'tool_use') {
-      return {
-        type: 'tool_use',
-        id: block.id,
-        name: block.name,
-        input: block.input as Record<string, unknown>,
-      };
-    }
-    // Fallback for unexpected block types
-    return { type: 'text', text: '' };
   });
 
   const stopReason =
     response.stop_reason === 'tool_use'
       ? 'tool_use'
       : response.stop_reason ?? 'stop';
+
+  const stopDetailsRaw = raw['stop_details'] as Record<string, unknown> | null | undefined;
+  const stopDetails = stopDetailsRaw
+    ? {
+        ...(typeof stopDetailsRaw['category'] === 'string' ? { category: stopDetailsRaw['category'] } : {}),
+        ...(typeof stopDetailsRaw['explanation'] === 'string' ? { explanation: stopDetailsRaw['explanation'] } : {}),
+      }
+    : undefined;
+  const inputTransformations = Array.isArray(raw['input_transformations'])
+    ? raw['input_transformations'] as InputTransformation[]
+    : undefined;
 
   const usageAny = response.usage as unknown as Record<string, unknown>;
   return {
@@ -334,5 +526,7 @@ function translateResponse(response: Anthropic.Message): ProviderResponse {
       cacheReadTokens: usageAny['cache_read_input_tokens'] as number | undefined,
       cacheWriteTokens: usageAny['cache_creation_input_tokens'] as number | undefined,
     },
+    ...(stopDetails ? { stopDetails } : {}),
+    ...(inputTransformations ? { inputTransformations } : {}),
   };
 }

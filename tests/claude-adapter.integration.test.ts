@@ -2,16 +2,22 @@
  * Claude integration tests — real API calls.
  *
  * Skipped unless INTEGRATION=true is set.
- * Requires ANTHROPIC_API_KEY in the environment (loaded from .env via dotenv).
+ * Requires ANTHROPIC_API_KEY in the environment. Nothing loads .env
+ * automatically; export it first (see .env.example).
  *
  * Run:
+ *   set -a; source .env; set +a
  *   INTEGRATION=true npx vitest run tests/claude-adapter.integration.test.ts
+ *   INTEGRATION=true npx vitest run tests/claude-adapter.integration.test.ts -t "R6"   # thinking models only
  */
 
 import { describe, it, expect } from 'vitest';
 import { ClaudeProviderAdapter } from '../src/adapters/provider/claude.js';
 import { ConversationEngine } from '../src/engine.js';
 import { InMemoryStorageAdapter } from '../src/adapters/storage/in-memory.js';
+import { IncompleteResponseError, InvalidRequestError } from '../src/errors.js';
+import type { ContentBlock, Message } from '../src/types.js';
+import type { ProviderResponse } from '../src/adapters/provider/types.js';
 
 const SKIP = process.env['INTEGRATION'] !== 'true';
 
@@ -459,4 +465,164 @@ describe.skipIf(LIVE_SKIP)('ClaudeProviderAdapter — AquantX requests, live', (
     expect(first.usage.cacheWriteTokens ?? 0).toBeGreaterThan(0);
     expect(second.usage.cacheReadTokens ?? 0).toBeGreaterThan(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// R6 — thinking models (Haiku 5.5, Sonnet 5.5)
+//
+// effort 'high' and a prompt that invites reasoning, so the model actually
+// thinks; blockBinding 'error' forces the history check on whatever the
+// account's age. Assertions that need a thinking block log and skip when the
+// model happened not to think.
+// ---------------------------------------------------------------------------
+
+const THINKING_MODELS = ['claude-haiku-5-5', 'claude-sonnet-5-5'];
+
+const QTY_TOOL = {
+  name: 'record_quantity',
+  description: 'Record a counted quantity of cartons.',
+  inputSchema: {
+    type: 'object',
+    properties: { count: { type: 'number' }, condition: { type: 'string' } },
+    required: ['count'],
+  },
+};
+
+const TURN_1 = 'We counted 140 cartons, but 12 were double-stacked and counted twice. ' +
+  'Work out the true count, record it with the tool, then say "done".';
+const TURN_2 = 'Now 63 crushed cartons too, minus the 5 already in the first count - ' +
+  'record the net figure, then say "ok".';
+
+function storedThinking(history: Message[]): Extract<ContentBlock, { type: 'thinking' }>[] {
+  return history.flatMap(m => typeof m.content === 'string'
+    ? []
+    : m.content.filter((b): b is Extract<ContentBlock, { type: 'thinking' }> => b.type === 'thinking'));
+}
+
+describe.skipIf(SKIP).each(THINKING_MODELS)('R6 thinking — live, %s', (model) => {
+  function makeEngine(opts: { thinkingHistory?: 'all' | 'current-turn'; maxTokens?: number } = {}) {
+    const apiKey = process.env['ANTHROPIC_API_KEY'];
+    if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+    const provider = new ClaudeProviderAdapter({
+      apiKey, model, maxTokens: opts.maxTokens ?? 4096, maxRetries: 0, effort: 'high', blockBinding: 'error',
+    });
+    const usage: ProviderResponse['usage'][] = [];
+    const engine = new ConversationEngine({
+      storage: new InMemoryStorageAdapter(),
+      provider,
+      thinkingHistory: opts.thinkingHistory,
+      hooks: { afterProviderCall: ctx => { usage.push(ctx.response.usage); } },
+    });
+    return { engine, provider, usage };
+  }
+
+  const loopOpts = { tools: [QTY_TOOL], toolExecutor: async () => 'recorded' };
+
+  it('two-turn agentLoop, same system prompt, default thinkingHistory: no 400', async () => {
+    const { engine } = makeEngine();
+    const thread = await engine.createThread({ type: 'live', ownerId: 'r6' });
+    await engine.agentLoop(thread.id, TURN_1, { ...loopOpts, systemPrompt: 'You are a cargo surveyor.' });
+    await engine.agentLoop(thread.id, TURN_2, { ...loopOpts, systemPrompt: 'You are a cargo surveyor.' });
+
+    const thinking = storedThinking(await engine.getHistory(thread.id));
+    console.log(`  ${model}: ${thinking.length} thinking blocks stored`);
+    for (const b of thinking) expect(b.signature.length).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("system prompt changed between turns: 'current-turn' passes, 'all' is the expected 400", async () => {
+    const { engine } = makeEngine({ thinkingHistory: 'current-turn' });
+    const thread = await engine.createThread({ type: 'live', ownerId: 'r6' });
+    await engine.agentLoop(thread.id, TURN_1, { ...loopOpts, systemPrompt: 'Case record v1.' });
+    const turn1Thought = storedThinking(await engine.getHistory(thread.id)).length > 0;
+
+    await engine.agentLoop(thread.id, TURN_2, { ...loopOpts, systemPrompt: 'Case record v2.' });
+
+    if (!turn1Thought) {
+      console.log(`  ${model}: turn 1 produced no thinking — skipping the 'all' negative control`);
+      return;
+    }
+    const err = await engine
+      .agentLoop(thread.id, 'Anything else to record?', {
+        ...loopOpts, systemPrompt: 'Case record v3.', thinkingHistory: 'all',
+      })
+      .catch(e => e);
+    expect(err).toBeInstanceOf(InvalidRequestError);
+    expect(String(err.message)).toMatch(/different conversation|signature/i);
+  }, 180_000);
+
+  it('streamAgentLoop and streamMessage persist thinking and report real usage', async () => {
+    const { engine, usage } = makeEngine({ thinkingHistory: 'current-turn' });
+    const thread = await engine.createThread({ type: 'live', ownerId: 'r6' });
+    let receivedUsage: ProviderResponse['usage'] | undefined;
+
+    const loop = engine.streamAgentLoop(thread.id, TURN_1, { ...loopOpts, systemPrompt: 'Turn A.' });
+    // The stream rethrows any failure; don't also leave completion unobserved.
+    loop.completion.catch(() => {});
+    for await (const _ of loop.stream) { /* drain */ }
+    await loop.completion;
+
+    const msg = engine.streamMessage(thread.id, 'Summarise the counts in one line.', { systemPrompt: 'Turn B.' });
+    msg.completion.catch(() => {});
+    for await (const chunk of msg.stream) if (chunk.done) receivedUsage = chunk.response?.usage;
+    await msg.completion;
+
+    console.log(`  ${model}: ${storedThinking(await engine.getHistory(thread.id)).length} thinking blocks stored`);
+    expect(usage.length).toBeGreaterThanOrEqual(3);
+    expect(usage.every(u => u.inputTokens > 0)).toBe(true);
+    expect(receivedUsage?.outputTokens).toBeGreaterThan(0);
+  }, 180_000);
+
+  it("display 'summarized' returns non-empty thinking text", async () => {
+    const apiKey = process.env['ANTHROPIC_API_KEY']!;
+    const adapter = new ClaudeProviderAdapter({
+      // Sonnet 5.5 often doesn't think on short prompts at 'high'; 'max' does.
+      apiKey, model, maxTokens: 8000, effort: 'max', thinking: { type: 'adaptive', display: 'summarized' },
+    });
+    let text = '';
+    for (let attempt = 0; attempt < 2 && !text; attempt++) {
+      const res = await adapter.send({
+        messages: [{ role: 'user', content: 'Is 391 prime? Reason it through, then answer yes or no.' }],
+      });
+      text = res.content.flatMap(b => (b.type === 'thinking' ? [b.thinking] : [])).join('');
+    }
+    expect(text.length).toBeGreaterThan(0);
+  }, 120_000);
+
+  it('unforced one-tool send(), then echoing the response into a follow-up: no 400', async () => {
+    const apiKey = process.env['ANTHROPIC_API_KEY']!;
+    const adapter = new ClaudeProviderAdapter({ apiKey, model, maxTokens: 4096, effort: 'low' });
+    const messages = [{ role: 'user' as const, content: 'Record 140 cartons using the tool.' }];
+    const first = await adapter.send({ messages, tools: [QTY_TOOL] });
+    const toolUse = first.content.find(b => b.type === 'tool_use');
+    expect(toolUse).toBeDefined();
+    if (toolUse?.type !== 'tool_use') return;
+
+    const second = await adapter.send({
+      tools: [QTY_TOOL],
+      messages: [
+        ...messages,
+        { role: 'assistant', content: first.content },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: 'recorded' }] },
+      ],
+    });
+    expect(second.stopReason).toBeTruthy();
+  }, 120_000);
+
+  it('maxTokens 64 with effort high surfaces max_tokens', async () => {
+    const { engine, provider } = makeEngine({ maxTokens: 64 });
+    const res = await provider.send({
+      messages: [{ role: 'user', content: 'Prove there are infinitely many primes, in detail.' }],
+    });
+    expect(res.stopReason).toBe('max_tokens');
+
+    const thread = await engine.createThread({ type: 'live', ownerId: 'r6' });
+    const outcome = await engine
+      .sendMessage(thread.id, 'Prove there are infinitely many primes, in detail.')
+      .catch(e => e);
+    if (outcome instanceof Error) {
+      expect(outcome).toBeInstanceOf(IncompleteResponseError);
+    } else {
+      expect(outcome.metadata?.stopReason).toBe('max_tokens');
+    }
+  }, 120_000);
 });

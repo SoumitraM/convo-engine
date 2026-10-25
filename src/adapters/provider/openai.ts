@@ -44,6 +44,7 @@ export interface OpenAIProviderAdapterOptions {
 }
 
 export class OpenAIProviderAdapter implements ProviderAdapter {
+  readonly name = 'openai' as const;
   private readonly client: OpenAI;
   private readonly model: string;
   private readonly maxTokens: number;
@@ -223,6 +224,18 @@ function translateMessages(
             });
           }
           break;
+        // Claude-only blocks: another provider can't read them.
+        case 'thinking':
+        case 'redacted_thinking':
+        case 'provider_raw':
+          break;
+        default: {
+          const unknownBlock: never = block;
+          throw new InvalidRequestError(
+            `OpenAIProviderAdapter: unsupported content block type '${(unknownBlock as { type: string }).type}'.`,
+            { provider: 'openai' },
+          );
+        }
       }
     }
 

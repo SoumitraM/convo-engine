@@ -6,20 +6,31 @@
 import type { Thread, ThreadId, Message, ContentBlock, ToolExecutor } from './types.js';
 import type { StorageAdapter } from './adapters/storage/types.js';
 import type {
+  BlockBinding,
+  Effort,
   ProviderAdapter,
+  ProviderInput,
   ProviderMessage,
   ProviderResponse,
   ProviderStreamChunk,
   SystemPrompt,
+  ThinkingConfig,
   ToolChoice,
   ToolDefinition,
 } from './adapters/provider/types.js';
 import type { ContextStrategy } from './context/strategy.js';
 import { SendAllWithTrailingCacheBreakpoint } from './context/strategy.js';
-import type { EngineHooks, SendContext, ReceiveContext } from './hooks/types.js';
+import { applyThinkingHistory, type ThinkingHistory } from './context/thinking-history.js';
+import type {
+  EngineHooks,
+  SendContext,
+  ReceiveContext,
+  ProviderCallContext,
+} from './hooks/types.js';
+import { IncompleteResponseError, RefusalError } from './errors.js';
 
 export { SendAllWithTrailingCacheBreakpoint };
-export type { ToolExecutor };
+export type { ToolExecutor, ThinkingHistory };
 
 /** Thrown by agentLoop when maxIterations is exceeded. */
 export class MaxIterationsExceededError extends Error {
@@ -38,9 +49,38 @@ export interface ConversationEngineConfig {
   hooks?: EngineHooks;
   contextStrategy?: ContextStrategy;
   defaultSystemPrompt?: SystemPrompt;
+  /**
+   * Which stored thinking blocks are sent back (default 'all'). Use
+   * 'current-turn' when the system prompt or tools change between turns.
+   * Overridable per call.
+   */
+  thinkingHistory?: ThinkingHistory;
 }
 
-export interface AgentLoopOptions {
+/** Thinking settings accepted by every send method. Provider settings are Claude-only. */
+export interface ThinkingOptions {
+  /** Overrides the adapter's default thinking setting for this call. */
+  thinking?: ThinkingConfig;
+  /** Overrides the adapter's default effort for this call. */
+  effort?: Effort;
+  /** Overrides the adapter's default blockBinding for this call. */
+  blockBinding?: BlockBinding;
+  /** Overrides the engine's thinkingHistory for this call. */
+  thinkingHistory?: ThinkingHistory;
+}
+
+export interface SendMessageOptions extends ThinkingOptions {
+  tools?: ToolDefinition[];
+  systemPrompt?: SystemPrompt;
+  toolChoice?: ToolChoice;
+}
+
+export interface StreamMessageOptions extends ThinkingOptions {
+  tools?: ToolDefinition[];
+  systemPrompt?: SystemPrompt;
+}
+
+export interface AgentLoopOptions extends ThinkingOptions {
   tools: ToolDefinition[];
   toolExecutor: ToolExecutor;
   systemPrompt?: SystemPrompt;
@@ -64,12 +104,31 @@ function toolChoiceForIteration(
   return iteration === 1 ? option : undefined;
 }
 
+type ToolUseBlock = Extract<ContentBlock, { type: 'tool_use' }>;
+
+function toolUseBlocksOf(content: ContentBlock[]): ToolUseBlock[] {
+  return content.filter((b): b is ToolUseBlock => b.type === 'tool_use');
+}
+
+/**
+ * The response for a streamed call whose adapter didn't supply one on the
+ * done chunk: the text, then any tool_use blocks. Usage is unknown.
+ */
+function assembleStreamedResponse(text: string, blocks: ContentBlock[]): ProviderResponse {
+  return {
+    content: [...(text.length > 0 ? [{ type: 'text' as const, text }] : []), ...blocks],
+    stopReason: blocks.some(b => b.type === 'tool_use') ? 'tool_use' : 'stop',
+    usage: { inputTokens: 0, outputTokens: 0 },
+  };
+}
+
 export class ConversationEngine {
   private readonly storage: StorageAdapter;
   private readonly provider: ProviderAdapter;
   private readonly hooks: EngineHooks;
   private readonly strategy: ContextStrategy;
   private readonly defaultSystemPrompt?: SystemPrompt;
+  private readonly thinkingHistory: ThinkingHistory;
 
   constructor(config: ConversationEngineConfig) {
     this.storage = config.storage;
@@ -77,6 +136,7 @@ export class ConversationEngine {
     this.hooks = config.hooks ?? {};
     this.strategy = config.contextStrategy ?? new SendAllWithTrailingCacheBreakpoint();
     this.defaultSystemPrompt = config.defaultSystemPrompt;
+    this.thinkingHistory = config.thinkingHistory ?? 'all';
   }
 
   // ── Public thread/history methods ─────────────────────────────────────────
@@ -102,47 +162,37 @@ export class ConversationEngine {
   async sendMessage(
     threadId: ThreadId,
     userContent: string | ContentBlock[],
-    opts?: { tools?: ToolDefinition[]; systemPrompt?: SystemPrompt; toolChoice?: ToolChoice },
+    opts?: SendMessageOptions,
   ): Promise<Message> {
     const { thread, userMessage, history } = await this._prepareUserMessage(
       threadId,
       userContent,
     );
 
-    const systemPrompt = opts?.systemPrompt ?? this.defaultSystemPrompt;
-
     let ctx: SendContext = {
       thread,
       history,
       newMessage: userMessage,
-      systemPrompt,
+      systemPrompt: opts?.systemPrompt ?? this.defaultSystemPrompt,
       tools: opts?.tools,
       toolChoice: opts?.toolChoice,
       iteration: 1,
+      thinking: opts?.thinking,
+      effort: opts?.effort,
+      blockBinding: opts?.blockBinding,
     };
 
     ctx = await this._runBeforeSend(ctx);
 
-    const messages = this.strategy.assemble(ctx.history, ctx.newMessage);
-
     let rawResponse: ProviderResponse;
     try {
-      rawResponse = await this.provider.send({
-        systemPrompt: ctx.systemPrompt,
-        messages,
-        tools: ctx.tools,
-        toolChoice: ctx.toolChoice,
-      });
+      rawResponse = await this.provider.send(this._providerInput(ctx, opts?.thinkingHistory));
     } catch (err) {
       this._callOnError(err, 'provider');
       throw err;
     }
 
-    const assistantMessage = await this.storage.appendMessage(threadId, {
-      threadId,
-      role: 'assistant',
-      content: rawResponse.content,
-    });
+    const assistantMessage = await this._storeResponse(threadId, ctx, userMessage, rawResponse);
 
     await this._runAfterReceive({
       thread,
@@ -159,7 +209,7 @@ export class ConversationEngine {
   streamMessage(
     threadId: ThreadId,
     userContent: string | ContentBlock[],
-    opts?: { tools?: ToolDefinition[]; systemPrompt?: SystemPrompt },
+    opts?: StreamMessageOptions,
   ): { stream: AsyncIterable<ProviderStreamChunk>; completion: Promise<Message> } {
     // completion is driven by consuming the stream
     let resolveCompletion!: (msg: Message) => void;
@@ -178,29 +228,25 @@ export class ConversationEngine {
           userContent,
         );
 
-        const systemPrompt = opts?.systemPrompt ?? engine.defaultSystemPrompt;
-
         let ctx: SendContext = {
           thread,
           history,
           newMessage: userMessage,
-          systemPrompt,
+          systemPrompt: opts?.systemPrompt ?? engine.defaultSystemPrompt,
           tools: opts?.tools,
           iteration: 1,
+          thinking: opts?.thinking,
+          effort: opts?.effort,
+          blockBinding: opts?.blockBinding,
         };
 
         ctx = await engine._runBeforeSend(ctx);
 
-        const messages = engine.strategy.assemble(ctx.history, ctx.newMessage);
-
         let providerStream: AsyncIterable<ProviderStreamChunk>;
         try {
-          providerStream = engine.provider.stream({
-            systemPrompt: ctx.systemPrompt,
-            messages,
-            tools: ctx.tools,
-            toolChoice: ctx.toolChoice,
-          });
+          providerStream = engine.provider.stream(
+            engine._providerInput(ctx, opts?.thinkingHistory),
+          );
         } catch (err) {
           engine._callOnError(err, 'provider');
           rejectCompletion(err);
@@ -209,40 +255,36 @@ export class ConversationEngine {
 
         const contentBlocks: ContentBlock[] = [];
         let textBuffer = '';
+        let finalResponse: ProviderResponse | undefined;
 
-        for await (const chunk of providerStream) {
-          yield chunk;
-          if (!chunk.done) {
-            if (typeof chunk.delta === 'string') {
+        try {
+          for await (const chunk of providerStream) {
+            yield chunk;
+            if (chunk.done) {
+              finalResponse = chunk.response;
+            } else if (typeof chunk.delta === 'string') {
               textBuffer += chunk.delta;
             } else {
               // ContentBlock delta (e.g. tool_use from streaming)
               contentBlocks.push(chunk.delta);
             }
           }
+        } catch (err) {
+          engine._callOnError(err, 'provider');
+          throw err;
         }
 
-        // Assemble the final content: if we have a text buffer, use it as text block
-        let finalContent: string | ContentBlock[];
-        if (contentBlocks.length > 0) {
-          finalContent = contentBlocks;
-        } else {
-          finalContent = textBuffer;
-        }
+        // Prefer the adapter's complete response (every block, in order, with
+        // real stopReason/usage). Otherwise assemble one from the deltas, and
+        // keep storing plain text as a string, as before.
+        const rawResponse = finalResponse ?? assembleStreamedResponse(textBuffer, contentBlocks);
+        const storedContent = finalResponse || contentBlocks.length > 0
+          ? rawResponse.content
+          : textBuffer;
 
-        const assistantMessage = await engine.storage.appendMessage(threadId, {
-          threadId,
-          role: 'assistant',
-          content: finalContent,
-        });
-
-        const rawResponse: ProviderResponse = {
-          content: typeof finalContent === 'string'
-            ? [{ type: 'text', text: finalContent }]
-            : finalContent,
-          stopReason: 'stop',
-          usage: { inputTokens: 0, outputTokens: 0 },
-        };
+        const assistantMessage = await engine._storeResponse(
+          threadId, ctx, userMessage, rawResponse, storedContent,
+        );
 
         await engine._runAfterReceive({
           thread,
@@ -296,34 +338,32 @@ export class ConversationEngine {
         tools: opts.tools,
         toolChoice: toolChoiceForIteration(opts.toolChoice, iteration),
         iteration,
+        thinking: opts.thinking,
+        effort: opts.effort,
+        blockBinding: opts.blockBinding,
       };
 
       ctx = await this._runBeforeSend(ctx);
 
-      const messages = this.strategy.assemble(ctx.history, ctx.newMessage);
-
       let rawResponse: ProviderResponse;
       try {
-        rawResponse = await this.provider.send({
-          systemPrompt: ctx.systemPrompt,
-          messages,
-          tools: ctx.tools,
-          toolChoice: ctx.toolChoice,
-        });
+        rawResponse = await this.provider.send(this._providerInput(ctx, opts.thinkingHistory));
       } catch (err) {
         this._callOnError(err, 'provider');
         throw err;
       }
 
       // Persist the assistant's response (could be tool_use or final answer)
-      const assistantMessage = await this.storage.appendMessage(threadId, {
-        threadId,
-        role: 'assistant',
-        content: rawResponse.content,
-      });
+      const assistantMessage = await this._storeResponse(threadId, ctx, userMessage, rawResponse);
+
+      // pause_turn: the provider stopped mid-turn; sending the conversation
+      // back (now ending with this assistant message) lets it continue.
+      if (rawResponse.stopReason === 'pause_turn') continue;
+
+      const toolUseBlocks = toolUseBlocksOf(rawResponse.content);
 
       // If the model is done (no tool calls), fire afterReceive and return
-      if (rawResponse.stopReason !== 'tool_use') {
+      if (rawResponse.stopReason !== 'tool_use' || toolUseBlocks.length === 0) {
         await this._runAfterReceive({
           thread,
           userMessage,
@@ -334,32 +374,7 @@ export class ConversationEngine {
       }
 
       // Execute all requested tools and persist results
-      const toolUseBlocks = rawResponse.content.filter(
-        (b): b is Extract<ContentBlock, { type: 'tool_use' }> => b.type === 'tool_use',
-      );
-
-      for (const toolUse of toolUseBlocks) {
-        let resultContent: string;
-        try {
-          const result = await opts.toolExecutor(toolUse.name, toolUse.input);
-          resultContent = typeof result === 'string' ? result : JSON.stringify(result);
-        } catch (err) {
-          this._callOnError(err, 'toolExecutor');
-          throw err;
-        }
-
-        await this.storage.appendMessage(threadId, {
-          threadId,
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: toolUse.id,
-              content: resultContent,
-            },
-          ],
-        });
-      }
+      await this._runTools(threadId, toolUseBlocks, opts.toolExecutor);
     }
 
     throw new MaxIterationsExceededError(maxIterations);
@@ -375,6 +390,7 @@ export class ConversationEngine {
    * `{ done: true }` chunk is yielded, at the very end of the whole turn
    * (not after each iteration), so callers see one continuous stream per
    * user message regardless of how many tool round-trips happened inside it.
+   * That chunk carries the final iteration's `response`, when available.
    */
   streamAgentLoop(
     threadId: ThreadId,
@@ -418,20 +434,18 @@ export class ConversationEngine {
             tools: opts.tools,
             toolChoice: toolChoiceForIteration(opts.toolChoice, iteration),
             iteration,
+            thinking: opts.thinking,
+            effort: opts.effort,
+            blockBinding: opts.blockBinding,
           };
 
           ctx = await engine._runBeforeSend(ctx);
 
-          const messages = engine.strategy.assemble(ctx.history, ctx.newMessage);
-
           let providerStream: AsyncIterable<ProviderStreamChunk>;
           try {
-            providerStream = engine.provider.stream({
-              systemPrompt: ctx.systemPrompt,
-              messages,
-              tools: ctx.tools,
-              toolChoice: ctx.toolChoice,
-            });
+            providerStream = engine.provider.stream(
+              engine._providerInput(ctx, opts.thinkingHistory),
+            );
           } catch (err) {
             engine._callOnError(err, 'provider');
             rejectCompletion(err);
@@ -441,39 +455,42 @@ export class ConversationEngine {
           // Accumulate this iteration's output. Text arrives as string deltas;
           // tool_use arrives as a ContentBlock delta (see provider adapters'
           // stream() implementations) — never mixed into the same delta.
-          const toolUseBlocks: ContentBlock[] = [];
+          const blockDeltas: ContentBlock[] = [];
           let textBuffer = '';
+          let finalResponse: ProviderResponse | undefined;
 
-          for await (const chunk of providerStream) {
-            // Swallow each iteration's own terminal chunk — only one `done`
-            // is surfaced to the caller, at the end of the whole loop.
-            if (chunk.done) continue;
-            if (typeof chunk.delta === 'string') {
-              textBuffer += chunk.delta;
-            } else {
-              toolUseBlocks.push(chunk.delta);
+          try {
+            for await (const chunk of providerStream) {
+              // Swallow each iteration's own terminal chunk — only one `done`
+              // is surfaced to the caller, at the end of the whole loop.
+              if (chunk.done) {
+                finalResponse = chunk.response;
+                continue;
+              }
+              if (typeof chunk.delta === 'string') {
+                textBuffer += chunk.delta;
+              } else {
+                blockDeltas.push(chunk.delta);
+              }
+              yield chunk;
             }
-            yield chunk;
+          } catch (err) {
+            engine._callOnError(err, 'provider');
+            throw err;
           }
 
-          const finalBlocks: ContentBlock[] = [];
-          if (textBuffer.length > 0) finalBlocks.push({ type: 'text', text: textBuffer });
-          finalBlocks.push(...toolUseBlocks);
+          const rawResponse = finalResponse ?? assembleStreamedResponse(textBuffer, blockDeltas);
 
-          const assistantMessage = await engine.storage.appendMessage(threadId, {
-            threadId,
-            role: 'assistant',
-            content: finalBlocks,
-          });
+          const assistantMessage = await engine._storeResponse(
+            threadId, ctx, userMessage, rawResponse,
+          );
 
-          if (toolUseBlocks.length === 0) {
+          if (rawResponse.stopReason === 'pause_turn') continue;
+
+          const toolUseBlocks = toolUseBlocksOf(rawResponse.content);
+
+          if (rawResponse.stopReason !== 'tool_use' || toolUseBlocks.length === 0) {
             // No tool calls this iteration — the turn is over.
-            const rawResponse: ProviderResponse = {
-              content: finalBlocks,
-              stopReason: 'stop',
-              usage: { inputTokens: 0, outputTokens: 0 },
-            };
-
             await engine._runAfterReceive({
               thread,
               userMessage,
@@ -481,41 +498,16 @@ export class ConversationEngine {
               rawResponse,
             });
 
-            yield { delta: '', done: true };
+            yield { delta: '', done: true, ...(finalResponse ? { response: finalResponse } : {}) };
             resolveCompletion(assistantMessage);
             return;
           }
 
           // Execute all requested tools and persist results, then loop again.
-          for (const block of toolUseBlocks) {
-            const toolUse = block as Extract<ContentBlock, { type: 'tool_use' }>;
-            let resultContent: string;
-            try {
-              const result = await opts.toolExecutor(toolUse.name, toolUse.input);
-              resultContent = typeof result === 'string' ? result : JSON.stringify(result);
-            } catch (err) {
-              engine._callOnError(err, 'toolExecutor');
-              rejectCompletion(err);
-              throw err;
-            }
-
-            await engine.storage.appendMessage(threadId, {
-              threadId,
-              role: 'user',
-              content: [
-                {
-                  type: 'tool_result',
-                  tool_use_id: toolUse.id,
-                  content: resultContent,
-                },
-              ],
-            });
-          }
+          await engine._runTools(threadId, toolUseBlocks, opts.toolExecutor);
         }
 
-        const err = new MaxIterationsExceededError(maxIterations);
-        rejectCompletion(err);
-        throw err;
+        throw new MaxIterationsExceededError(maxIterations);
       } catch (err) {
         rejectCompletion(err);
         throw err;
@@ -549,6 +541,113 @@ export class ConversationEngine {
     return { thread, userMessage, history };
   }
 
+  /** Context assembly, then the thinkingHistory step — custom strategies included. */
+  private _providerInput(ctx: SendContext, thinkingHistory?: ThinkingHistory): ProviderInput {
+    const messages = applyThinkingHistory(
+      this.strategy.assemble(ctx.history, ctx.newMessage),
+      thinkingHistory ?? this.thinkingHistory,
+    );
+    return {
+      systemPrompt: ctx.systemPrompt,
+      messages,
+      tools: ctx.tools,
+      toolChoice: ctx.toolChoice,
+      ...(ctx.thinking !== undefined ? { thinking: ctx.thinking } : {}),
+      ...(ctx.effort !== undefined ? { effort: ctx.effort } : {}),
+      ...(ctx.blockBinding !== undefined ? { blockBinding: ctx.blockBinding } : {}),
+    };
+  }
+
+  /**
+   * Stores a provider response as the assistant message, with its stopReason
+   * and usage in `metadata`, and fires afterProviderCall. Refusals and
+   * responses cut off before anything usable are not stored: they throw
+   * RefusalError / IncompleteResponseError instead.
+   */
+  private async _storeResponse(
+    threadId: ThreadId,
+    ctx: SendContext,
+    userMessage: Message,
+    response: ProviderResponse,
+    content: string | ContentBlock[] = response.content,
+  ): Promise<Message> {
+    const provider = this.provider.name ?? 'custom';
+    let failure: Error | undefined;
+
+    if (response.stopReason === 'refusal') {
+      const category = response.stopDetails?.category;
+      failure = new RefusalError(
+        `The model declined to respond${category ? ` (category: ${category})` : ''}.`,
+        { provider, category, explanation: response.stopDetails?.explanation },
+      );
+    } else if (response.stopReason === 'max_tokens') {
+      // Text that was cut off is still an answer. A cut-off tool call can't
+      // be run (and a stored tool_use without a result breaks the next
+      // request); a thinking-only response has nothing to show.
+      const hasText = response.content.some(b => b.type === 'text' && b.text.trim() !== '');
+      const hasToolUse = response.content.some(b => b.type === 'tool_use');
+      if (!hasText || hasToolUse) {
+        failure = new IncompleteResponseError(
+          hasToolUse
+            ? 'The response hit maxTokens in the middle of a tool call.'
+            : 'The response hit maxTokens before producing any text — raise maxTokens or lower effort.',
+          { provider, stopReason: response.stopReason },
+        );
+      }
+    }
+
+    if (failure) {
+      await this._runAfterProviderCall({
+        thread: ctx.thread, userMessage, iteration: ctx.iteration, response,
+      });
+      this._callOnError(failure, 'provider');
+      throw failure;
+    }
+
+    const assistantMessage = await this.storage.appendMessage(threadId, {
+      threadId,
+      role: 'assistant',
+      content,
+      metadata: { stopReason: response.stopReason, usage: response.usage },
+    });
+
+    await this._runAfterProviderCall({
+      thread: ctx.thread, userMessage, iteration: ctx.iteration, response, assistantMessage,
+    });
+
+    return assistantMessage;
+  }
+
+  /** Runs each requested tool and stores its result as a user message. */
+  private async _runTools(
+    threadId: ThreadId,
+    toolUseBlocks: ToolUseBlock[],
+    toolExecutor: ToolExecutor,
+  ): Promise<void> {
+    for (const toolUse of toolUseBlocks) {
+      let resultContent: string;
+      try {
+        const result = await toolExecutor(toolUse.name, toolUse.input);
+        resultContent = typeof result === 'string' ? result : JSON.stringify(result);
+      } catch (err) {
+        this._callOnError(err, 'toolExecutor');
+        throw err;
+      }
+
+      await this.storage.appendMessage(threadId, {
+        threadId,
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUse.id,
+            content: resultContent,
+          },
+        ],
+      });
+    }
+  }
+
   private async _runBeforeSend(ctx: SendContext): Promise<SendContext> {
     if (!this.hooks.beforeSend) return ctx;
     try {
@@ -569,9 +668,18 @@ export class ConversationEngine {
     }
   }
 
+  private async _runAfterProviderCall(ctx: ProviderCallContext): Promise<void> {
+    if (!this.hooks.afterProviderCall) return;
+    try {
+      await this.hooks.afterProviderCall(ctx);
+    } catch (err) {
+      this._callOnError(err, 'afterProviderCall');
+    }
+  }
+
   private _callOnError(
     err: unknown,
-    phase: 'beforeSend' | 'provider' | 'toolExecutor' | 'afterReceive',
+    phase: 'beforeSend' | 'provider' | 'toolExecutor' | 'afterReceive' | 'afterProviderCall',
   ): void {
     if (!this.hooks.onError) return;
     try {
@@ -598,4 +706,5 @@ export type {
   EngineHooks,
   SendContext,
   ReceiveContext,
+  ProviderCallContext,
 };

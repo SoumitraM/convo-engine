@@ -47,6 +47,7 @@ export interface GatewayProviderAdapterOptions {
 }
 
 export class GatewayProviderAdapter implements ProviderAdapter {
+  readonly name = 'gateway' as const;
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly model: string;
@@ -294,6 +295,18 @@ export class GatewayProviderAdapter implements ProviderAdapter {
             );
           }
           textParts.push(documentAsText(block));
+        } else if (
+          block.type === 'thinking' ||
+          block.type === 'redacted_thinking' ||
+          block.type === 'provider_raw'
+        ) {
+          // Claude-only blocks: another provider can't read them.
+        } else {
+          const unknownBlock: never = block;
+          throw new InvalidRequestError(
+            `GatewayProviderAdapter: unsupported content block type '${(unknownBlock as { type: string }).type}'.`,
+            { provider: 'gateway' },
+          );
         }
       }
 
