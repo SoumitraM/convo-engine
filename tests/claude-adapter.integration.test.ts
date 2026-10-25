@@ -2,10 +2,13 @@
  * Claude integration tests — real API calls.
  *
  * Skipped unless INTEGRATION=true is set.
- * Requires ANTHROPIC_API_KEY in the environment (loaded from .env via dotenv).
+ * Requires ANTHROPIC_API_KEY in the environment. Nothing loads .env
+ * automatically; export it first (see .env.example).
  *
  * Run:
+ *   set -a; source .env; set +a
  *   INTEGRATION=true npx vitest run tests/claude-adapter.integration.test.ts
+ *   INTEGRATION=true npx vitest run tests/claude-adapter.integration.test.ts -t "R6"   # thinking models only
  */
 
 import { describe, it, expect } from 'vitest';
@@ -553,10 +556,13 @@ describe.skipIf(SKIP).each(THINKING_MODELS)('R6 thinking — live, %s', (model) 
     let receivedUsage: ProviderResponse['usage'] | undefined;
 
     const loop = engine.streamAgentLoop(thread.id, TURN_1, { ...loopOpts, systemPrompt: 'Turn A.' });
+    // The stream rethrows any failure; don't also leave completion unobserved.
+    loop.completion.catch(() => {});
     for await (const _ of loop.stream) { /* drain */ }
     await loop.completion;
 
     const msg = engine.streamMessage(thread.id, 'Summarise the counts in one line.', { systemPrompt: 'Turn B.' });
+    msg.completion.catch(() => {});
     for await (const chunk of msg.stream) if (chunk.done) receivedUsage = chunk.response?.usage;
     await msg.completion;
 
@@ -569,7 +575,8 @@ describe.skipIf(SKIP).each(THINKING_MODELS)('R6 thinking — live, %s', (model) 
   it("display 'summarized' returns non-empty thinking text", async () => {
     const apiKey = process.env['ANTHROPIC_API_KEY']!;
     const adapter = new ClaudeProviderAdapter({
-      apiKey, model, maxTokens: 4096, effort: 'high', thinking: { type: 'adaptive', display: 'summarized' },
+      // Sonnet 5.5 often doesn't think on short prompts at 'high'; 'max' does.
+      apiKey, model, maxTokens: 8000, effort: 'max', thinking: { type: 'adaptive', display: 'summarized' },
     });
     let text = '';
     for (let attempt = 0; attempt < 2 && !text; attempt++) {

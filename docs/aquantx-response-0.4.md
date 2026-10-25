@@ -3,8 +3,8 @@
 **Answers:** `docs/aquantx-requests-0.4.md` (R6, requested 2026-10-25).
 **Status:** R6.1–R6.9 are built and unit-tested. They ship in **0.4.0**: see `CHANGELOG.md`, and the
 README's "Thinking models" section.
-**Not yet run:** the live tests. They're written (`tests/claude-adapter.integration.test.ts`,
-"R6 thinking — live") but haven't run against the API. See "Testing" at the end.
+**Live tests:** all 12 R6 live checks pass on Haiku 5.5 and Sonnet 5.5 (run 2026-10-25). See
+"Testing" at the end.
 **AquantX files referenced** were read on 2026-10-25 (AquantX `6eb17f1`). Paths in Part 2 are
 relative to the AquantX repo root.
 
@@ -388,13 +388,24 @@ are dropped when sending.
   (`thinkingHistory`, stop reasons, usage, streamed responses) and in the
   `claude-adapter`/`openai-adapter`/`gateway-adapter` tests (mapping, options, `blockBinding`,
   stream final response). They cover every unit item in §4 of the request.
-- **Live (written, not yet run):** every live item in §4, on `claude-haiku-5-5` and
-  `claude-sonnet-5-5`, with `effort: 'high'` and `blockBinding: 'error'`. They need an API key:
+- **Live (run 2026-10-25, all passing):** every live item in §4, on `claude-haiku-5-5` and
+  `claude-sonnet-5-5`, with `effort: 'high'` and `blockBinding: 'error'`. 12 tests, run as:
 
   ```bash
-  INTEGRATION=true ANTHROPIC_API_KEY=... npx vitest run tests/claude-adapter.integration.test.ts -t "R6"
+  set -a; source .env; set +a
+  INTEGRATION=true npx vitest run tests/claude-adapter.integration.test.ts -t "R6"
   ```
 
-  Until these, or AquantX's `verify:engine` R6 checks, have run, treat the API-facing details as
-  unverified. That means the beta header via request options, `input_transformations`, and the
-  streamed signature handling.
+  The results confirm, against the live API:
+  - **The original bug is fixed.** The two-turn `agentLoop` works, and the stored thinking blocks
+    have non-empty signatures, streamed ones included.
+  - **The changed-system-prompt case behaves as designed.** It passes under `'current-turn'`, and
+    the `'all'` negative control returns the expected 400 as `InvalidRequestError`.
+  - **The opt-in controls work.** The `blockBinding` beta header passes through request options.
+  - **Streaming reports real numbers.** Streamed calls report real usage to `afterProviderCall`.
+  - **`max_tokens` with a small cap surfaces correctly.**
+
+  **One finding for AquantX:** at `effort: 'high'`, Sonnet 5.5 often doesn't think at all on short
+  prompts. Two of two short reasoning prompts came back with no thinking block, while at `'max'`
+  both did. The summarized-display test therefore runs at `'max'`. Don't rely on a "thinking…"
+  indicator always appearing on Sonnet.
