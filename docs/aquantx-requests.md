@@ -1,6 +1,6 @@
 # Enhancement requests from AquantX
 
-**Status:** open - requested 2026-10-16. Nothing here is built yet.
+**Status:** built in 0.3.0 - see `docs/aquantx-response.md`. **Next round:** `docs/aquantx-requests-0.4.md` (R6, thinking-capable Claude models).
 **Requested by:** AquantX (`apps/web`, consumes `@smsoumitra/convo-engine`; currently pinned to
 **0.1.0** - it will move to the release that carries these).
 **Where AquantX tracks its side:** `docs/sme-cargo-damage-plan.md` → "When convo-engine ships the

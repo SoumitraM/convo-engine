@@ -451,3 +451,32 @@ describe('GatewayProviderAdapter error mapping', () => {
     expect(err).toBeInstanceOf(RateLimitError);
   });
 });
+
+describe('GatewayProviderAdapter thinking blocks (R6.8)', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('drops thinking, redacted_thinking and provider_raw blocks from requests', async () => {
+    mockFetchJson(OK_COMPLETION);
+    const adapter = new GatewayProviderAdapter({ baseUrl: 'https://example.com' });
+    await adapter.send({
+      messages: [
+        { role: 'user', content: 'Q' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'secret', signature: 's' },
+            { type: 'redacted_thinking', data: 'enc' },
+            { type: 'provider_raw', provider: 'claude', block: { type: 'x' } },
+            { type: 'text', text: 'A' },
+          ],
+        },
+        { role: 'user', content: 'Q2' },
+      ],
+    });
+    expect(lastBody().messages).toEqual([
+      { role: 'user', content: 'Q' },
+      { role: 'assistant', content: 'A' },
+      { role: 'user', content: 'Q2' },
+    ]);
+  });
+});

@@ -419,3 +419,35 @@ describe('OpenAIProviderAdapter error mapping', () => {
     expect((err as ProviderError).retryable).toBe(true);
   });
 });
+
+describe('OpenAIProviderAdapter thinking blocks (R6.8)', () => {
+  beforeEach(() => {
+    mockChatCreate.mockReset();
+    mockChatCreate.mockResolvedValue(makeOpenAITextResponse('ok'));
+  });
+
+  it('drops thinking, redacted_thinking and provider_raw blocks from requests', async () => {
+    const adapter = new OpenAIProviderAdapter({ apiKey: 'k' });
+    await adapter.send({
+      messages: [
+        { role: 'user', content: 'Q' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'secret', signature: 's' },
+            { type: 'redacted_thinking', data: 'enc' },
+            { type: 'provider_raw', provider: 'claude', block: { type: 'x' } },
+            { type: 'text', text: 'A' },
+          ],
+        },
+        { role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: 's2' }] },
+        { role: 'user', content: 'Q2' },
+      ],
+    });
+    expect(mockChatCreate.mock.calls[0][0].messages).toEqual([
+      { role: 'user', content: 'Q' },
+      { role: 'assistant', content: 'A' },
+      { role: 'user', content: 'Q2' },
+    ]);
+  });
+});

@@ -11,7 +11,8 @@
  * may carry its own copy of these classes.
  */
 
-export type ProviderName = 'claude' | 'openai' | 'gateway';
+/** 'custom' labels errors from a consumer's own adapter that doesn't set a name. */
+export type ProviderName = 'claude' | 'openai' | 'gateway' | 'custom';
 
 const KINDS = Symbol.for('@smsoumitra/convo-engine/ProviderError.kinds');
 
@@ -93,6 +94,43 @@ export class AuthenticationError extends ProviderError {
  */
 export class InvalidRequestError extends ProviderError {
   static override readonly kind: string = 'InvalidRequestError';
+}
+
+/**
+ * The model declined to answer (Claude: `stop_reason: 'refusal'`, from its
+ * safety classifiers). Raised by the engine; the refused assistant content is
+ * not stored. Not retryable as-is.
+ */
+export class RefusalError extends ProviderError {
+  static override readonly kind: string = 'RefusalError';
+  /** e.g. 'cyber', 'bio'. An open set — may be undefined. */
+  readonly category?: string;
+  readonly explanation?: string;
+
+  constructor(
+    message: string,
+    options: ProviderErrorOptions & { category?: string; explanation?: string },
+  ) {
+    super(message, { ...options, retryable: false });
+    this.category = options.category;
+    this.explanation = options.explanation;
+  }
+}
+
+/**
+ * The response hit the output-token limit before producing anything usable —
+ * no text, or a tool call cut off mid-way. Raised by the engine; nothing is
+ * stored for the assistant. With thinking models this usually means the
+ * thinking used up `maxTokens`: raise it, or lower `effort`.
+ */
+export class IncompleteResponseError extends ProviderError {
+  static override readonly kind: string = 'IncompleteResponseError';
+  readonly stopReason: string;
+
+  constructor(message: string, options: ProviderErrorOptions & { stopReason: string }) {
+    super(message, { ...options, retryable: false });
+    this.stopReason = options.stopReason;
+  }
 }
 
 // ---------------------------------------------------------------------------

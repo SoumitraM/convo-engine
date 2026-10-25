@@ -36,6 +36,7 @@ The following files must have **zero imports from npm** (enforced by code review
 - `src/errors.ts`
 - `src/adapters/provider/shared.ts` (bundled into every adapter entry point)
 - `src/context/strategy.ts`
+- `src/context/thinking-history.ts`
 - `src/hooks/types.ts`
 - `src/adapters/storage/types.ts`
 - `src/adapters/storage/in-memory.ts`
@@ -45,6 +46,10 @@ The following files must have **zero imports from npm** (enforced by code review
 ## agentLoop persistence rule
 
 All intermediate `tool_use` and `tool_result` messages ARE persisted to the thread (not just the final answer). This is intentional — do not "optimise" it away. The context assembled for the next user turn requires seeing the full tool exchange history.
+
+## Thinking blocks are sent back verbatim
+
+Never filter, merge or rewrite stored `thinking` / `redacted_thinking` blocks in an adapter: Claude checks each block's signature against the conversation that produced it. The only sanctioned removal is `applyThinkingHistory` (`src/context/thinking-history.ts`), which strips a *leading* run of blocks and runs after `strategy.assemble()`. Removing blocks from the middle of the history breaks every later block.
 
 ## `streamMessage` does not run tool loops
 

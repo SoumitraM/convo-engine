@@ -23,7 +23,20 @@ export type ContentBlock =
       title?: string;
       /** Optional note passed to the model alongside the document. */
       context?: string;
-    };
+    }
+  /**
+   * A model's reasoning. `thinking` is empty when the provider omits the text
+   * (Claude's default display); `signature` must be kept byte-for-byte, since
+   * the provider checks it when the block is sent back.
+   */
+  | { type: 'thinking';          thinking: string; signature: string }
+  /** Reasoning the provider returns encrypted. Sent back as-is. */
+  | { type: 'redacted_thinking'; data: string }
+  /**
+   * A response block the adapter doesn't model. Stored verbatim, re-sent
+   * unchanged to the provider that produced it, and skipped by the others.
+   */
+  | { type: 'provider_raw'; provider: string; block: Record<string, unknown> };
 
 /**
  * Source of a `document` block. PDFs travel as base64; text sources carry the

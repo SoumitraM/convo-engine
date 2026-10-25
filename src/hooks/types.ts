@@ -5,8 +5,11 @@
 
 import type { Thread, Message } from '../types.js';
 import type {
+  BlockBinding,
+  Effort,
   ProviderResponse,
   SystemPrompt,
+  ThinkingConfig,
   ToolChoice,
   ToolDefinition,
 } from '../adapters/provider/types.js';
@@ -25,6 +28,23 @@ export interface SendContext {
   /** 1-based provider-call number within this turn. Always 1 for sendMessage
    *  and streamMessage; counts up across agentLoop tool round-trips. */
   iteration: number;
+  /** Per-call provider settings (Claude). A hook may change them. */
+  thinking?: ThinkingConfig;
+  effort?: Effort;
+  blockBinding?: BlockBinding;
+}
+
+export interface ProviderCallContext {
+  thread: Thread;
+  userMessage: Message;
+  /** Same numbering as SendContext.iteration. */
+  iteration: number;
+  /** The complete response, with real stopReason and usage — streamed calls
+   *  included when the adapter supplies a final response. */
+  response: ProviderResponse;
+  /** The stored assistant message; undefined when nothing was stored
+   *  (a refusal, or an IncompleteResponseError). */
+  assistantMessage?: Message;
 }
 
 export interface ReceiveContext {
@@ -48,8 +68,18 @@ export interface EngineHooks {
    * persisted. Use for side effects: extraction logic, logging, analytics.
    * Does not mutate what's already stored.
    * In agentLoop, fires exactly once — on the final assistant message only.
+   * `rawResponse` is that final provider call's response; for usage across
+   * every call in a loop, use afterProviderCall.
    */
   afterReceive?: (ctx: ReceiveContext) => Promise<void> | void;
+
+  /**
+   * Runs after every provider call — once per agentLoop iteration, and once
+   * for sendMessage/streamMessage — including calls that end in a refusal or
+   * an IncompleteResponseError (they are billed too). Use it to meter usage.
+   * Errors are reported to onError and don't propagate.
+   */
+  afterProviderCall?: (ctx: ProviderCallContext) => Promise<void> | void;
 
   /**
    * Called when an error occurs in any engine-managed phase.
@@ -58,6 +88,6 @@ export interface EngineHooks {
    */
   onError?: (
     err: unknown,
-    phase: 'beforeSend' | 'provider' | 'toolExecutor' | 'afterReceive',
+    phase: 'beforeSend' | 'provider' | 'toolExecutor' | 'afterReceive' | 'afterProviderCall',
   ) => void;
 }
